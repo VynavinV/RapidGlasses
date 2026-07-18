@@ -16,7 +16,8 @@ import threading
 import time
 from collections import deque
 
-from flask import Blueprint, jsonify
+import requests
+from flask import Blueprint, Response, jsonify
 
 tracking_bp = Blueprint("tracking", __name__)
 
@@ -34,9 +35,14 @@ DEBUG_TITLE = "RapidGlasses Head Sway"
 SWAY_GAIN = 12            # sway is a few % of frame; magnify it to be visible
 DEV_HISTORY = 240
 
+# Every raw frame is forwarded here (RGB bytes) so the node Presage bridge can
+# measure heart rate off the same camera. Failures back off, never block sway.
+VITALS_FRAME_URL = os.environ.get("VITALS_FRAME_URL", "http://localhost:3002/frame")
+
 _lock = threading.Lock()
 _thread = None
 _stop = threading.Event()
+_jpeg = None              # latest annotated frame as JPEG, for /tracking/video
 
 # Everything below _lock is read by request threads and written by the loop.
 _state = {
@@ -105,11 +111,42 @@ def _draw_debug(cv2, np, frame, pt, mean, deviation, fps, n, hist):
     return frame
 
 
+def _forward_frame(sess, rgb, w, h, backoff):
+    """POST one raw RGB frame to the node vitals bridge. backoff is a 1-item
+    list holding the next monotonic time we're allowed to try after a failure."""
+    now = time.monotonic()
+    if now < backoff[0]:
+        return
+    try:
+        sess.post(VITALS_FRAME_URL, data=rgb.tobytes(),
+                  headers={"X-Width": str(w), "X-Height": str(h),
+                           "X-Ts": str(int(now * 1_000_000))},
+                  timeout=0.5)
+    except requests.RequestException:
+        backoff[0] = now + 2.0
+
+
+def _publish(cv2, np, frame, pt, mean, deviation, fps, n, hist):
+    """Annotate the frame and store it as JPEG for /tracking/video (and the
+    optional local debug window)."""
+    global _jpeg
+    annotated = _draw_debug(cv2, np, frame, pt, mean, deviation, fps, n, hist)
+    ok, jpg = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    if ok:
+        with _lock:
+            _jpeg = jpg.tobytes()
+    if DEBUG_WINDOW:
+        cv2.imshow(DEBUG_TITLE, annotated)
+        cv2.waitKey(1)   # required to pump the HighGUI event loop
+
+
 def _loop():
     cap = landmarker = None
     n = 0                 # frames folded into the mean since start
     sum_x = sum_y = 0.0
     stamps = deque(maxlen=FPS_WINDOW)
+    sess = requests.Session()
+    vitals_backoff = [0.0]
 
     try:
         # Imported here so the server still boots (minus tracking) without them.
@@ -150,6 +187,8 @@ def _loop():
             stamps.append(now)
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            _forward_frame(sess, rgb, frame.shape[1], frame.shape[0],
+                           vitals_backoff)
             res = landmarker.detect_for_video(
                 mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb),
                 int(now * 1000))    # VIDEO mode wants ms, strictly increasing
@@ -166,11 +205,8 @@ def _loop():
                 with _lock:
                     _state["face"] = False
                     _state["fps"] = fps
-                if DEBUG_WINDOW:
-                    mean = (sum_x / n, sum_y / n) if n else None
-                    cv2.imshow(DEBUG_TITLE, _draw_debug(
-                        cv2, np, frame, None, mean, None, fps, n, hist))
-                    cv2.waitKey(1)
+                mean = (sum_x / n, sum_y / n) if n else None
+                _publish(cv2, np, frame, None, mean, None, fps, n, hist)
                 continue
 
             lm = res.face_landmarks[0][NOSE_TIP]
@@ -187,12 +223,9 @@ def _loop():
                               deviation=deviation, timestamp=stamps[-1],
                               fps=fps, face=True)
 
-            if DEBUG_WINDOW:
-                hist.append(deviation)
-                cv2.imshow(DEBUG_TITLE, _draw_debug(
-                    cv2, np, frame, (x, y), (mean_x, mean_y), deviation,
-                    fps, n, hist))
-                cv2.waitKey(1)   # required to pump the HighGUI event loop
+            hist.append(deviation)
+            _publish(cv2, np, frame, (x, y), (mean_x, mean_y), deviation,
+                     fps, n, hist)
     except BaseException as exc:
         # Never die silently — a dead thread with running=True would leave QNX
         # polling stale values forever.
@@ -210,8 +243,10 @@ def _loop():
             landmarker.close()
         if cap is not None:
             cap.release()
+        global _jpeg
         with _lock:
             _state["running"] = False
+            _jpeg = None
 
 
 @tracking_bp.route("/tracking/start", methods=["POST"])
@@ -243,6 +278,22 @@ def stop():
     with _lock:
         _state["running"] = False
     return jsonify(status="stopped")
+
+
+@tracking_bp.route("/tracking/video")
+def video():
+    """MJPEG stream of the annotated camera view (same drawing as the debug
+    window) — embedded by index.html as a plain <img>."""
+    def gen():
+        while True:
+            with _lock:
+                jpg = _jpeg
+            if jpg is not None:
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                       + jpg + b"\r\n")
+            time.sleep(0.05)   # ~20 fps is plenty for a monitor view
+    return Response(gen(),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
 @tracking_bp.route("/tracking/snapshot", methods=["GET"])

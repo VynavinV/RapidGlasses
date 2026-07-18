@@ -68,13 +68,35 @@ System Settings → Privacy & Security → Camera → enable your terminal
 (Terminal, iTerm, or VS Code). You must fully quit and reopen the terminal
 afterwards for it to take effect.
 
+## 5b. Heart rate via Presage (optional, one-time)
+
+Presage SmartSpectra has no Python SDK, so heart rate runs in a small Node
+process (`vitals-server/`). `secondcheck.py` starts and stops it automatically;
+you only need to set it up once:
+
+1. Install Node.js 18+ (`brew install node` on macOS; check with `node --version`).
+2. `cd vitals-server && npm install` — downloads a few hundred MB of native
+   runtimes; this is expected.
+3. Get an API key from <https://physiology.presagetech.com> (create an account,
+   generate a key) and add it to the project `.env`:
+
+   ```
+   SMARTSPECTRA_API_KEY=your-key-here
+   ```
+
+Without the key or `npm install`, everything else still works — the heart rate
+badge just shows `--`, and `http://localhost:3002/vitals` reports why.
+
 ## 6. Run
 
 ```bash
 python secondcheck.py
 ```
 
-Serves on `http://localhost:3001`. Leave it running.
+Serves on `http://localhost:3001` (and the vitals bridge on `:3002`). Leave it
+running. The webpage now starts the camera on load and shows an annotated
+monitor view bottom-right (same drawing as the debug window) plus a live heart
+rate badge top-right; the camera stays on the whole time the page is open.
 
 ## 7. Open the UI
 

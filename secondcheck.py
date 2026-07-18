@@ -1,4 +1,6 @@
+import atexit
 import os
+import subprocess
 
 import requests
 from dotenv import load_dotenv
@@ -54,5 +56,23 @@ def speak():
     return Response(resp.iter_content(chunk_size=4096), mimetype="audio/mpeg")
 
 
+# ---- Presage vitals bridge (node) ----
+# Presage has no Python SDK, so heart rate runs in a small node process
+# (vitals-server/server.js). tracking.py forwards it camera frames; the
+# webpage polls it at :3002/vitals. Needs SMARTSPECTRA_API_KEY in .env.
+
+VITALS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vitals-server")
+
+
+def _start_vitals_server():
+    try:
+        proc = subprocess.Popen(["node", "server.js"], cwd=VITALS_DIR)
+    except OSError as exc:
+        print(f"vitals server not started ({exc}) — heart rate unavailable")
+        return
+    atexit.register(lambda: proc.poll() is None and proc.terminate())
+
+
 if __name__ == "__main__":
-    app.run(port=3001)
+    _start_vitals_server()
+    app.run(port=3001, threaded=True)

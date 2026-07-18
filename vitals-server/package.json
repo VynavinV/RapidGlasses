@@ -1,0 +1,9 @@
+{
+  "name": "rapidglasses-vitals",
+  "private": true,
+  "description": "Presage SmartSpectra bridge: accepts RGB frames from tracking.py over HTTP, serves live vitals JSON.",
+  "main": "server.js",
+  "dependencies": {
+    "@smartspectra/node-sdk": "latest"
+  }
+}

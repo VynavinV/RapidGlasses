@@ -128,9 +128,49 @@
 
   .footer { min-height: 4rem; display: flex; align-items: center; }
   .calib-status { font-size: 1rem; color: var(--gray); }
+
+  /* Camera monitor (FaceTime-style, bottom right) */
+  #cam-overlay {
+    position: fixed;
+    right: 1.2rem; bottom: 1.2rem;
+    width: 320px; height: auto;
+    border-radius: 0.8rem;
+    background: #111;
+    box-shadow: 0 6px 24px rgba(0,0,0,0.25);
+    z-index: 50;
+  }
+
+  /* Live heart rate (top right) */
+  #hr-badge {
+    position: fixed;
+    right: 1.2rem; top: 1.2rem;
+    display: flex; align-items: center; gap: 0.5rem;
+    padding: 0.55rem 1rem;
+    border-radius: 2rem;
+    background: var(--gray-light);
+    font-size: 1.05rem;
+    font-variant-numeric: tabular-nums;
+    z-index: 50;
+  }
+  #hr-badge .heart { color: #d64550; }
+  #hr-badge.live .heart { animation: breathe 1s ease-in-out infinite; }
+  #hr-badge .bpm { font-weight: 600; }
+  #hr-status {
+    position: fixed;
+    right: 1.2rem; top: 4rem;
+    max-width: 16rem;
+    text-align: right;
+    font-size: 0.8rem;
+    color: var(--gray);
+    z-index: 50;
+  }
 </style>
 </head>
 <body>
+
+<div id="hr-badge"><span class="heart">&#10084;</span><span class="bpm" id="hr-value">--</span><span>bpm</span></div>
+<div id="hr-status"></div>
+<img id="cam-overlay" alt="camera">
 
 <div class="screen active" id="waiting">
   <div class="waiting-pulse"></div>
@@ -206,6 +246,7 @@ const COMPLETE_MS     = 4000;
 
 // ---- Head tracking (local Flask blueprint; QNX polls /tracking/snapshot) ----
 const TRACKING_BASE = 'http://localhost:3001/tracking';
+const VITALS_URL = 'http://localhost:3002/vitals';
 
 // Fire-and-forget: a tracking failure must never stall the assessment.
 function trackStart() {
@@ -214,6 +255,43 @@ function trackStart() {
 function trackStop() {
   fetch(TRACKING_BASE + '/stop', { method: 'POST' }).catch(() => {});
 }
+
+// ---- Camera monitor + heart rate (always on while the page is open) ----
+// The camera starts at page load, not at Balance: Presage needs continuous
+// frames for heart rate, and the overlay lets you see exactly what the
+// tracker sees. Each test's trackStart() only rebaselines the sway mean.
+const camImg = document.getElementById('cam-overlay');
+function connectCam() {
+  camImg.src = TRACKING_BASE + '/video?' + Date.now(); // cachebuster on retry
+}
+camImg.onerror = () => setTimeout(connectCam, 2000);
+trackStart();
+connectCam();
+
+const hrBadge = document.getElementById('hr-badge');
+const hrValue = document.getElementById('hr-value');
+const hrStatus = document.getElementById('hr-status');
+setInterval(() => {
+  fetch(VITALS_URL)
+    .then(r => r.json())
+    .then(v => {
+      const fresh = v.bpm != null && Date.now() - v.updated < 10000;
+      hrValue.textContent = fresh ? v.bpm : '--';
+      hrBadge.classList.toggle('live', fresh);
+      // Always-visible reason: SDK hint if any, else lifecycle status,
+      // plus breathing so you can see data is flowing.
+      const parts = [];
+      if (v.hint) parts.push(v.hint);
+      else if (!fresh) parts.push('waiting for pulse — ' + v.status);
+      if (v.breathing != null) parts.push(v.breathing + ' br/min');
+      hrStatus.textContent = parts.join(' · ');
+    })
+    .catch(() => {
+      hrValue.textContent = '--';
+      hrBadge.classList.remove('live');
+      hrStatus.textContent = 'vitals server offline';
+    });
+}, 1000);
 
 function show(id) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
@@ -346,8 +424,8 @@ function startVor() {
   show('vor');
   trackStart();
   speak("Keep your eyes on the dot. Gently turn your head side to side.");
+  // Camera stays on after VOR — Presage keeps measuring heart rate.
   setTimeout(() => {
-    trackStop();
     document.getElementById('vor-next').disabled = false;
   }, VOR_MS);
 }
@@ -395,7 +473,7 @@ function submitRecall() {
 }
 
 function resetAll() {
-  trackStop();  // safety net if the flow reset mid-test
+  trackStart();  // rebaseline for the next run; camera never stops
   ['recall-next', 'balance-next', 'pursuit-next', 'vor-next', 'submit-btn']
     .forEach(id => document.getElementById(id).disabled = true);
   document.getElementById('wave').classList.add('idle');
