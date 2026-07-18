@@ -214,6 +214,19 @@ function startRecallPriming() {
 // Spoken via the local ElevenLabs proxy — never rendered as text on screen.
 const RECALL_WORDS = ["apple", "dog", "green", "road", "seven"];
 const RECALL_AUDIO_URL = 'http://localhost:3001/api/recall-audio';
+const SPEAK_URL = 'http://localhost:3001/api/speak';
+
+// Speak an instruction aloud via ElevenLabs. Fire-and-forget; UI never blocks on it.
+function speak(text) {
+  fetch(SPEAK_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text })
+  })
+    .then(r => r.ok ? r.blob() : Promise.reject())
+    .then(blob => new Audio(URL.createObjectURL(blob)).play())
+    .catch(() => {});
+}
 
 function playRecallWords() {
   document.getElementById('wave').classList.remove('idle');
@@ -238,6 +251,7 @@ function playRecallWords() {
 // ---- Balance: fixed dot + progress ring ----
 function startBalance() {
   show('balance');
+  speak("Look at the dot. Try to stay still.");
   const fill = document.querySelector('#balance-ring .fill');
   const C = 2 * Math.PI * 56;
   fill.style.strokeDasharray = C;
@@ -253,6 +267,7 @@ function startBalance() {
 // ---- Smooth pursuit: horizontal sweep, then vertical sweep ----
 function startPursuit() {
   show('pursuit');
+  speak("Follow the dot with your eyes. Keep your head still.");
   const dot = document.getElementById('pursuit-dot');
   const start = performance.now();
   (function tick(now) {
@@ -275,6 +290,7 @@ function startPursuit() {
 // ---- VOR: fixed dot with pacing pulse ----
 function startVor() {
   show('vor');
+  speak("Keep your eyes on the dot. Gently turn your head side to side.");
   setTimeout(() => document.getElementById('vor-next').disabled = false, VOR_MS);
 }
 
@@ -303,6 +319,7 @@ function startRecallMarking() {
   });
   document.getElementById('submit-btn').disabled = true;
   show('recall-marking');
+  speak("Which of these words did you hear?");
 }
 
 function mark(i, correct, btn) {
