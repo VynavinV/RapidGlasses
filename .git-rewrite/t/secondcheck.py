@@ -5,8 +5,6 @@ from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 
-from tracking import tracking_bp
-
 load_dotenv()
 
 VOICE_ID = "21m00Tcm4TlvDq8ikWAM"  # Rachel — swap as needed
@@ -15,7 +13,6 @@ ELEVENLABS_URL = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
 
 app = Flask(__name__)
 CORS(app)
-app.register_blueprint(tracking_bp)
 
 
 def _tts(phrase):
