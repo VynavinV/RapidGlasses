@@ -15,13 +15,7 @@ app = Flask(__name__)
 CORS(app)
 
 
-@app.route("/api/recall-audio", methods=["POST"])
-def recall_audio():
-    words = (request.get_json(silent=True) or {}).get("words", [])
-    if not words:
-        return jsonify(error="No words provided"), 400
-
-    phrase = ", ".join(words)
+def _tts(phrase):
     resp = requests.post(
         ELEVENLABS_URL,
         headers={"xi-api-key": os.environ.get("ELEVENLABS_API_KEY", "")},
@@ -29,8 +23,31 @@ def recall_audio():
         stream=True,
     )
     if resp.status_code != 200:
-        return jsonify(error="ElevenLabs request failed"), 500
+        return None
+    return resp
 
+
+@app.route("/api/recall-audio", methods=["POST"])
+def recall_audio():
+    words = (request.get_json(silent=True) or {}).get("words", [])
+    if not words:
+        return jsonify(error="No words provided"), 400
+
+    resp = _tts(", ".join(words))
+    if resp is None:
+        return jsonify(error="ElevenLabs request failed"), 500
+    return Response(resp.iter_content(chunk_size=4096), mimetype="audio/mpeg")
+
+
+@app.route("/api/speak", methods=["POST"])
+def speak():
+    text = (request.get_json(silent=True) or {}).get("text", "").strip()
+    if not text:
+        return jsonify(error="No text provided"), 400
+
+    resp = _tts(text)
+    if resp is None:
+        return jsonify(error="ElevenLabs request failed"), 500
     return Response(resp.iter_content(chunk_size=4096), mimetype="audio/mpeg")
 
 
