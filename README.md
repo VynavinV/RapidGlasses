@@ -501,3 +501,361 @@ This section exists so a new contributor — especially an AI coding agent start
 - **`report.py` has a real security issue as shipped** (`debug=True` + `host="0.0.0.0"`, §6.10) — don't copy this pattern into new server code, and flag it if asked to productionize anything.
 - **Before adding a new top-level Python file, check whether its name will collide in meaning with an existing one** — this repo already has one confirmed case (`main.py` vs `secondcheck.py`, §6.2) where filenames actively lie about their role. `server.py` / `report.py` / `tracking.py` / `main.py` (pupil tool) is the current, not-entirely-self-explanatory set; consider proposing clearer names rather than adding a fifth confusingly-named file.
 - **This README is the map, not the code.** If anything above turns out to be stale (a file moved, a route changed), trust the current source over this document and update the relevant section rather than propagating the discrepancy — see the note in each section about where the underlying facts were verified (git history, `git ls-tree`, direct file reads).
+
+# Report Wrapper Documentation
+
+The report system is a clinician-facing tool that renders assessment data into a professional, printable HTML report. It consists of four interconnected components:
+
+- **report.py** – Flask backend that loads data and renders templates
+- **report.html** – Jinja2 template that defines report layout and structure
+- **report_data.json** – Assessment data in standardized JSON format
+- **style.css** – Visual styling, colors, and responsive layout
+
+The system reads a JSON file containing all assessment metrics and transforms it into a styled, interactive HTML document suitable for hospital charts and clinical review.
+
+---
+
+## report.py – Backend Server
+
+### Purpose
+Runs a Flask HTTP server on port 8080 that loads assessment data from disk and renders it into a templated HTML report. This is a standalone application separate from the main assessment UI.
+
+### Key Responsibilities
+- Loads and validates `report_data.json` on each request
+- Provides error handling with appropriate HTTP status codes (503 if data missing, 500 if invalid JSON)
+- Formats timestamps from ISO 8601 to human-readable text
+- Maps metric status values to semantic CSS classes for visual styling
+- Passes data and helper functions to the template engine
+
+### Core Functions
+
+**Data Loading**
+Reads `report_data.json` from the same directory as the script. Validates that the file exists and contains valid JSON structured as a single object. Returns appropriate error responses if data is missing or malformed.
+
+**Timestamp Formatting**
+Converts ISO 8601 datetime strings (with timezone information) into readable format suitable for clinical display. Falls back gracefully to the original string if parsing fails.
+
+**Status Classification**
+Maps free-text status strings (e.g., "elevated_variance", "borderline", "normal") into four semantic CSS classes:
+- `good` (green) – normal findings
+- `warn` (orange) – borderline findings
+- `alert` (red) – elevated/abnormal findings
+- `neutral` (gray) – unclassified
+
+This mapping serves as a reference for clinical thresholds and vocabularies used throughout the assessment.
+
+### HTTP Routes
+
+**`GET /` or `GET /report`**
+- Returns the fully rendered HTML report
+- Loads data from disk
+- Builds template context with all variables needed for rendering
+- Applies formatting and status classification
+
+**`GET /api/report`**
+- Returns raw JSON from `report_data.json`
+- Provides machine-readable access to the same data
+
+### Running the Server
+Execute `python report.py` to start the Flask development server. The server listens on `http://localhost:8080` with debug mode enabled. Note: debug mode and `host="0.0.0.0"` together are development-only; production deployment requires a proper WSGI server (Gunicorn, etc.).
+
+### Template Context Variables
+The Flask route builds a context dictionary containing:
+- Complete assessment data and all nested objects
+- Extracted outcome, stage1, stage3, fusion, narration, metadata
+- Formatted timestamp (human-readable)
+- CSS class for outcome banner color
+- Reference to status_class function for inline template use
+
+---
+
+## report.html – Template Structure
+
+### Purpose
+Jinja2 template that renders assessment data into a structured, accessible HTML report. The template is defensive against partial or missing data, using fallbacks throughout.
+
+### Core Characteristics
+- Responsive mobile-first layout that scales from phone to desktop
+- Conditional section rendering (sections hidden if data absent or flags false)
+- Status-aware styling (metric cards color-coded by clinical status)
+- Semantic HTML with accessibility attributes
+- Print-friendly design with optimized print styles
+
+### Document Sections
+
+**Header**
+Contains session identification, assessment timestamp, and participant information. Uses full-width gradient background with white text. Displays session ID, formatted timestamp, and optional participant name in a styled metadata card.
+
+**Disclaimer**
+Always-visible legal notice stating the device does not provide medical diagnosis and results are for sideline triage only. Blue-accented styling draws attention without alarming.
+
+**Outcome Banner**
+Primary result display showing the screening verdict. Includes headline text, SCAT5 severity score, and return-to-play clearance status. Colors dynamically based on verdict: red for "refer", green for "cleared". Two-column layout with outcome text on left and SCAT5 score card on right.
+
+**Summary Grid**
+Three-column display of gate decision, assessment duration, and fusion composite score. Each metric shown in a card with label and prominent numeric value. Responsive: stacks to single column on narrow screens.
+
+**Hard Override Flags** (Conditional)
+Red warning panel that appears only if medical emergency flags are triggered. Lists specific flag details (anisocoria asymmetry measurement, severe VOR deviation ratio). Indicates urgent referral required regardless of other scores.
+
+**Narration** (Conditional)
+Plain-language summary of findings written by the assessment system. Optionally includes bulleted list of clinical recommendations or next steps. Only renders if narration data is provided.
+
+**Stage 1 Metrics**
+Four metric cards covering primary screening: pupil diameter, blink dynamics, pupillary light response, heart rate/HRV. Each card displays relevant measurements with reference ranges. Color-coded by clinical status. Includes composite score for Stage 1.
+
+**Stage 3 Metrics** (Conditional)
+Four metric cards covering secondary battery (if triggered): balance, smooth pursuit, VOR, delayed recall. Layout and styling identical to Stage 1 cards. Only displays if `outcome.stage3_triggered` is true. Includes composite score for Stage 3.
+
+**Device Footer** (Conditional)
+Lists capture devices used in assessment and report schema version. Only displays if metadata is provided. Tracks which hardware/software components generated the data.
+
+### Template Features
+
+**Data Handling Patterns**
+- Uses fallback values (em-dash) for missing fields
+- Conditional blocks for optional sections
+- Call to status_class function to determine card colors
+- String filters for formatting (capitalization, underscores, decimal places)
+
+**Conditional Rendering**
+- Entire Stage 3 section hidden if not triggered
+- Hard override panel hidden if no flags triggered
+- Narration section hidden if summary absent
+- Device list hidden if metadata absent
+
+---
+
+## report_data.json – Data Schema
+
+### Purpose
+Single source of truth for all assessment metrics. Currently a hand-authored sample, but defines the data contract that a real pipeline must produce. Structured as a JSON object with nested fields for each stage, scores, and metadata.
+
+### Top-Level Structure
+
+**Session Information**
+- Session ID: unique identifier for the assessment
+- Patient label: optional participant name or identifier
+- Assessed at: ISO 8601 timestamp with timezone
+- Assessment duration: total seconds from start to finish
+
+**Outcome**
+Contains the final verdict and severity scores. Includes flag ("refer" or "clear"), headline text, SCAT5 score, gate decision status, and return-to-play clearance boolean. Tracks whether Stage 3 was triggered.
+
+**Hard Overrides**
+Medical emergency flags that trigger urgent referral:
+- Anisocoria: pupil size asymmetry measurements with threshold
+- Severe VOR: vestibulo-ocular reflex deviation ratio with threshold
+Each has a triggered boolean and detailed measurements.
+
+**Stage 1 Metrics**
+Primary screening measurements including pupil characteristics, blink dynamics, pupillary light response, and heart rate/HRV data. Each metric has a status field and a composite score for the stage.
+
+**Stage 3 Metrics** (Optional)
+Secondary battery if escalated. Contains balance sway measurements, smooth pursuit correlation values, VOR variance data, and delayed recall word lists. Only present if Stage 3 triggered. Includes composite score.
+
+**Fusion**
+Composite scoring information. Defines weighting between Stage 1 and Stage 3. Contains final weighted composite score and text explaining the decision basis.
+
+**Narration** (Optional)
+Plain-language clinical summary. May include human-readable explanation of findings and bulleted recommendations for follow-up.
+
+**Metadata** (Optional)
+Device identification and schema versioning. Lists hardware/software components used (eye tracker, heart rate monitor, fusion node platform). Tracks report and assessment schema versions for compatibility tracking.
+
+### Status Field Values
+
+Status fields throughout the schema use consistent string values:
+- `"normal"` – within expected range
+- `"borderline"` – near threshold but not exceeded
+- `"ambiguous"` – unclear, requires further evaluation
+- `"mild_deviation"` – slightly abnormal
+- `"elevated"` or `"elevated_variance"` or `"elevated_hr"` – moderately abnormal
+- `"deviation"` – significantly abnormal
+
+These map to the CSS status classes in report.py.
+
+### Field Types
+
+Timestamps are ISO 8601 format with timezone. Numeric values use appropriate precision (millimeters for distance, hertz for frequency, percentage for ratios, milliseconds for timing). Arrays contain strings for word lists and device names. Nested objects organize related measurements.
+
+---
+
+## style.css – Styling System
+
+### Purpose
+Defines visual design, responsive layout, typography, and status-aware color coding. Uses CSS custom properties (variables) for theming and mobile-first responsive design.
+
+### Color Palette
+
+**Brand Colors**
+Primary blue for headers and interactive elements. Light blue for soft backgrounds and overlays.
+
+**Verdict Colors**
+Red family for "refer" verdict (urgent, requires medical evaluation). Green family for "clear" verdict (passed screening).
+
+**Status Colors**
+- Green for normal/good findings
+- Orange for borderline/warning findings
+- Red for elevated/alert findings
+- Gray for neutral/unclassified findings
+
+**Neutral Colors**
+- Light background for page
+- White for card surfaces
+- Dark gray for primary text
+- Medium gray for secondary text
+- Light gray for borders
+
+**Effects**
+Subtle drop shadow on cards (soft, not aggressive). Rounded corners on cards (18px) and smaller components (12px).
+
+### Typography
+
+**Font Family**
+System font stack prioritizing Segoe UI, Helvetica Neue, Arial, sans-serif for good rendering across platforms.
+
+**Font Sizes**
+- Headers scale responsively with viewport width (using CSS clamp)
+- Body text: 0.95–1rem for readability
+- Secondary text: 0.78–0.88rem for labels and captions
+- Metric values: 1.5rem+ bold for prominence
+
+**Line Height**
+- Body: 1.55 for readable spacing
+- Headers: 1.15 for compact display
+
+### Layout Components
+
+**Container**
+Maximum width of 1100px with 1rem padding on each side. Centers content horizontally.
+
+**Header**
+Full-width gradient background with white text. Two-column flex layout: brand on left, session metadata on right. Substantial padding for visual prominence.
+
+**Main Content**
+Vertical padding for breathing room between sections.
+
+**Grid Layouts**
+- Three-column grid for summary cards (gate decision, duration, composite)
+- Two-column grid for metric cards (pupil, blink, PLR, HR/HRV)
+- Single-row flex for header components
+
+**Responsive Design**
+Mobile-first approach with no hard breakpoints. Uses CSS Grid/Flex defaults that naturally stack on narrow screens. Font sizes scale fluidly with viewport width using `clamp()` function. Padding and margins scale proportionally.
+
+### Component Styling
+
+**Cards**
+White background with light gray border. Soft shadow for depth. 18px rounded corners. 1.1–1.3rem padding. Consistent spacing across all card types.
+
+**Metric Cards**
+Colored top border (4px) based on status class. Key-value pairs displayed as flex layout (label left, value right). Dashed border separators between rows. Status badge (pill) positioned in header.
+
+**Status Pill**
+Small inline badge displaying metric status. Background and text color match status (green/orange/red/gray). Fully rounded appearance. Capitalized, non-wrapping text.
+
+**Outcome Banner**
+Two-column layout: outcome copy on left (1.4fr width), SCAT5 score card on right (0.8fr width). Gradient background colors dynamically based on verdict. SCAT5 score displayed large and bold.
+
+**Override Panel**
+Red background and borders indicating urgency. Compact bulleted list of triggered flags. Only appears if flags present.
+
+### Theming System
+
+All colors, spacing, and effects use CSS custom properties (variables) defined at root level. This allows:
+- Easy global color changes by updating variable values
+- Consistency across all components
+- Future dark mode support by redefining variables
+
+---
+
+## Data Flow
+
+Assessment pipeline writes `report_data.json` → Flask loads and validates JSON → Template context built with helper functions → Jinja2 renders HTML with conditional sections → Browser fetches stylesheet → Styled report displays in browser.
+
+Each stage transforms the data into a more human-friendly format:
+1. Raw JSON (machine format)
+2. Python dict (validated)
+3. Enhanced context (timestamps formatted, statuses mapped to CSS classes)
+4. Templated HTML (semantic structure with conditionals)
+5. Styled display (colors, layout, typography applied)
+
+---
+
+## Extension Points
+
+### Adding New Metrics
+1. Pipeline writes new field to report_data.json
+2. Flask extracts field (transformation if needed)
+3. Template adds new card in appropriate section
+4. CSS status class styling applied automatically
+
+### Changing Colors
+Update CSS custom property values in the style root. Single source of change for brand, verdict, and status colors.
+
+### Adding Sections
+Add Jinja conditional block in template for new section. Create corresponding CSS classes for layout and styling.
+
+### Modifying Layout
+Adjust CSS Grid columns and gaps. Flex properties for component alignment. No changes to template needed for simple layout adjustments.
+
+---
+
+## Error Scenarios
+
+| Situation | HTTP Response | Display Result |
+|-----------|---------------|-----------------|
+| report_data.json missing | 503 Service Unavailable | Server indicates pipeline hasn't written data |
+| Invalid JSON syntax | 500 Internal Server Error | Server indicates malformed JSON |
+| JSON not an object | 500 Internal Server Error | Server indicates wrong JSON structure |
+| Missing field in data | 200 OK | Field renders as em-dash (—) |
+| Timestamp parse fails | 200 OK | Original ISO string displayed as fallback |
+
+---
+
+## Deployment Considerations
+
+### Development
+Running `python report.py` starts Flask's development server with debug mode enabled. Suitable only for local development and trusted environments.
+
+### Production
+Requires proper WSGI server (Gunicorn, uWSGI, etc.). Debug mode must be disabled. Host should be restricted or placed behind reverse proxy for security. SSL/TLS encryption recommended for network transmission.
+
+### File Paths
+Template folder and static folder both configured to project root. Moving `report.html` or `style.css` into subdirectories requires updating Flask configuration.
+
+### Data Source
+Currently reads `report_data.json` from same directory as script on every request. No caching. No database. Suitable for prototype; real deployment would benefit from persistent storage and caching.
+
+---
+
+## Clinical Design Principles
+
+The report system enforces several clinical safety patterns:
+
+**Hard Overrides**
+Medical emergency flags (anisocoria, severe VOR) are separate from normal scoring. Triggered overrides force urgent referral regardless of other scores. This reflects real clinical practice where certain findings are red flags.
+
+**Status Vocabulary**
+Status strings map to consistent CSS classes. This creates a single source of truth for what counts as normal/borderline/concerning. New metrics should use existing vocabulary.
+
+**Defensive Templating**
+Missing data renders as em-dash rather than breaking or showing errors. Sections hide gracefully if not applicable. Incomplete assessments produce valid reports.
+
+**Printability**
+Report designed to print or export as PDF for physical chart insertion. Print styles remove shadows for readability on paper.
+
+---
+
+## Future Work
+
+To connect the report system to real data:
+
+1. Assessment pipeline must write `report_data.json` with correct schema after each assessment completes
+2. Stage 1 capture pipeline (currently missing from repo) must feed pupil, blink, PLR, HR/HRV data
+3. Fusion node (QNX/Raspberry Pi) must orchestrate stages, compute composites, and apply thresholds
+4. Narration generation requires either templating engine or LLM-based clinical summary writer
+5. Persistence layer needed to store reports and allow retrieval by session ID
+
+Currently all components are present and functional, but disconnected. The data contract (report_data.json schema) is defined; implementation needs to flow data through each stage into that contract.
