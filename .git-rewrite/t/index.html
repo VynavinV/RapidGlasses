@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Stage 3 Assessment</title>
+<style>
+  :root {
+    --blue: #4a7fb5;
+    --blue-soft: #dbe7f3;
+    --gray: #6b7683;
+    --gray-light: #eef1f4;
+    --text: #2c3540;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: #fff;
+    color: var(--text);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  .screen {
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2.5rem;
+    width: 100%;
+    height: 100%;
+    padding: 3rem;
+    text-align: center;
+  }
+  .screen.active { display: flex; }
+  h1 { font-size: 1.6rem; font-weight: 600; }
+  p.instruction { font-size: 1.25rem; color: var(--gray); max-width: 34rem; line-height: 1.6; }
+  button {
+    font-size: 1.1rem;
+    padding: 0.9rem 2.8rem;
+    border: none;
+    border-radius: 2rem;
+    background: var(--blue);
+    color: #fff;
+    cursor: pointer;
+    transition: opacity 0.3s;
+  }
+  button:disabled { opacity: 0.35; cursor: default; }
+  button.secondary { background: var(--gray-light); color: var(--text); }
+
+  /* Waiting */
+  .waiting-pulse {
+    width: 14px; height: 14px; border-radius: 50%;
+    background: var(--blue);
+    animation: breathe 2.4s ease-in-out infinite;
+  }
+  @keyframes breathe {
+    0%, 100% { transform: scale(1); opacity: 0.5; }
+    50% { transform: scale(1.6); opacity: 1; }
+  }
+
+  /* Audio waveform indicator */
+  .wave { display: flex; gap: 6px; align-items: center; height: 48px; }
+  .wave span {
+    width: 6px; height: 12px; border-radius: 3px;
+    background: var(--blue);
+    animation: wavebar 1s ease-in-out infinite;
+  }
+  .wave span:nth-child(2) { animation-delay: 0.15s; }
+  .wave span:nth-child(3) { animation-delay: 0.3s; }
+  .wave span:nth-child(4) { animation-delay: 0.45s; }
+  .wave span:nth-child(5) { animation-delay: 0.6s; }
+  @keyframes wavebar {
+    0%, 100% { height: 12px; }
+    50% { height: 44px; }
+  }
+  .wave.idle span { animation: none; height: 12px; opacity: 0.4; }
+
+  /* Test stage: dot + progress ring */
+  .stage { position: relative; width: 100%; flex: 1; }
+  .dot {
+    position: absolute;
+    width: 26px; height: 26px;
+    border-radius: 50%;
+    background: var(--blue);
+    left: 50%; top: 50%;
+    transform: translate(-50%, -50%);
+  }
+  .dot.pacing { animation: pace 2s ease-in-out infinite; }
+  /* Subtle metronome pulse to pace head turns during VOR */
+  @keyframes pace {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(74,127,181,0.35); }
+    50% { box-shadow: 0 0 0 22px rgba(74,127,181,0); }
+  }
+  .ring { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); }
+  .ring circle { fill: none; stroke-width: 3; }
+  .ring .track { stroke: var(--gray-light); }
+  .ring .fill {
+    stroke: var(--blue-soft);
+    stroke-linecap: round;
+    transform: rotate(-90deg);
+    transform-origin: center;
+  }
+
+  /* Recall marking */
+  .slots { display: flex; flex-direction: column; gap: 1rem; width: 100%; max-width: 26rem; }
+  .slot {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 1rem 1.4rem;
+    background: var(--gray-light);
+    border-radius: 0.8rem;
+    font-size: 1.1rem;
+  }
+  .slot .toggles { display: flex; gap: 0.6rem; }
+  .slot .toggles button {
+    padding: 0.5rem 1.2rem;
+    font-size: 0.95rem;
+    background: #fff;
+    color: var(--gray);
+    border: 1px solid #d5dbe2;
+  }
+  .slot .word { text-transform: capitalize; }
+  .slot .toggles button.sel-correct { background: var(--blue); color: #fff; border-color: var(--blue); }
+  .slot .toggles button.sel-incorrect { background: var(--gray); color: #fff; border-color: var(--gray); }
+
+  .footer { min-height: 4rem; display: flex; align-items: center; }
+</style>
+</head>
+<body>
+
+<div class="screen active" id="waiting">
+  <div class="waiting-pulse"></div>
+  <h1>Waiting for Stage 1 signal</h1>
+  <!-- TODO: replace click with real Stage 1 signal (WebSocket/push) -->
+  <button class="secondary" onclick="show('intro')">Simulate signal</button>
+</div>
+
+<div class="screen" id="intro">
+  <h1>Quick check-in</h1>
+  <p class="instruction">We'll do a few short exercises together. Just follow the instructions on screen.</p>
+  <button onclick="startRecallPriming()">Begin</button>
+</div>
+
+<div class="screen" id="recall-priming">
+  <p class="instruction">Listen carefully and remember these words.</p>
+  <div class="wave idle" id="wave"><span></span><span></span><span></span><span></span><span></span></div>
+  <div class="footer"><button id="recall-next" disabled onclick="startBalance()">Next</button></div>
+</div>
+
+<div class="screen" id="balance">
+  <p class="instruction">Look at the dot. Try to stay still.</p>
+  <div class="stage">
+    <svg class="ring" id="balance-ring" width="120" height="120">
+      <circle class="track" cx="60" cy="60" r="56"></circle>
+      <circle class="fill" cx="60" cy="60" r="56"></circle>
+    </svg>
+    <div class="dot"></div>
+  </div>
+  <div class="footer"><button id="balance-next" disabled onclick="startPursuit()">Next</button></div>
+</div>
+
+<div class="screen" id="pursuit">
+  <p class="instruction">Follow the dot with your eyes. Keep your head still.</p>
+  <div class="stage"><div class="dot" id="pursuit-dot"></div></div>
+  <div class="footer"><button id="pursuit-next" disabled onclick="startVor()">Next</button></div>
+</div>
+
+<div class="screen" id="vor">
+  <p class="instruction">Keep your eyes on the dot. Gently turn your head side to side.</p>
+  <div class="stage"><div class="dot pacing"></div></div>
+  <div class="footer"><button id="vor-next" disabled onclick="startRecallMarking()">Next</button></div>
+</div>
+
+<div class="screen" id="recall-marking">
+  <h1>Recall check</h1>
+  <p class="instruction">Which of these words did you hear?</p>
+  <div class="slots" id="slots"></div>
+  <div class="footer"><button id="submit-btn" disabled onclick="submitRecall()">Submit</button></div>
+</div>
+
+<div class="screen" id="complete">
+  <div class="wave"><span></span><span></span><span></span><span></span><span></span></div>
+  <h1>Sending results...</h1>
+</div>
+
+<script>
+// ---- Durations (ms) — tune here ----
+const RECALL_FALLBACK_MS = 8000; // enable Next even if audio 'ended' never fires
+const BALANCE_MS      = 20000;
+const PURSUIT_MS      = 15000;
+const VOR_MS          = 20000;
+const COMPLETE_MS     = 4000;
+
+// TODO: replace with MediaPipe/OpenCV head tracking — start/stop capture
+// per test in startBalance / startPursuit / startVor.
+
+function show(id) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+
+// ---- Recall priming ----
+function startRecallPriming() {
+  show('recall-priming');
+  playRecallWords().then(() => {
+    document.getElementById('wave').classList.add('idle');
+    document.getElementById('recall-next').disabled = false;
+  });
+}
+
+// Spoken via the local ElevenLabs proxy — never rendered as text on screen.
+const RECALL_WORDS = ["apple", "dog", "green", "road", "seven"];
+const RECALL_AUDIO_URL = 'http://localhost:3001/api/recall-audio';
+const SPEAK_URL = 'http://localhost:3001/api/speak';
+
+// Speak an instruction aloud via ElevenLabs. Fire-and-forget; UI never blocks on it.
+function speak(text) {
+  fetch(SPEAK_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text })
+  })
+    .then(r => r.ok ? r.blob() : Promise.reject())
+    .then(blob => new Audio(URL.createObjectURL(blob)).play())
+    .catch(() => {});
+}
+
+function playRecallWords() {
+  document.getElementById('wave').classList.remove('idle');
+  return new Promise(resolve => {
+    const fallback = setTimeout(resolve, RECALL_FALLBACK_MS);
+    const done = () => { clearTimeout(fallback); resolve(); };
+    fetch(RECALL_AUDIO_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ words: RECALL_WORDS })
+    })
+      .then(r => { if (!r.ok) throw new Error('proxy error ' + r.status); return r.blob(); })
+      .then(blob => {
+        const audio = new Audio(URL.createObjectURL(blob));
+        audio.onended = done;
+        return audio.play();
+      })
+      .catch(done);
+  });
+}
+
+// ---- Balance: fixed dot + progress ring ----
+function startBalance() {
+  show('balance');
+  speak("Look at the dot. Try to stay still.");
+  const fill = document.querySelector('#balance-ring .fill');
+  const C = 2 * Math.PI * 56;
+  fill.style.strokeDasharray = C;
+  const start = performance.now();
+  (function tick(now) {
+    const t = Math.min((now - start) / BALANCE_MS, 1);
+    fill.style.strokeDashoffset = C * (1 - t);
+    if (t < 1) requestAnimationFrame(tick);
+    else document.getElementById('balance-next').disabled = false;
+  })(start);
+}
+
+// ---- Smooth pursuit: horizontal sweep, then vertical sweep ----
+function startPursuit() {
+  show('pursuit');
+  speak("Follow the dot with your eyes. Keep your head still.");
+  const dot = document.getElementById('pursuit-dot');
+  const start = performance.now();
+  (function tick(now) {
+    const t = Math.min((now - start) / PURSUIT_MS, 1);
+    let x = 50, y = 50; // percent of stage
+    if (t < 0.5) {
+      // horizontal: center → right → left → center
+      x = 50 + 38 * Math.sin(t / 0.5 * 2 * Math.PI);
+    } else {
+      // vertical: center → down → up → center
+      y = 50 + 30 * Math.sin((t - 0.5) / 0.5 * 2 * Math.PI);
+    }
+    dot.style.left = x + '%';
+    dot.style.top = y + '%';
+    if (t < 1) requestAnimationFrame(tick);
+    else document.getElementById('pursuit-next').disabled = false;
+  })(start);
+}
+
+// ---- VOR: fixed dot with pacing pulse ----
+function startVor() {
+  show('vor');
+  speak("Keep your eyes on the dot. Gently turn your head side to side.");
+  setTimeout(() => document.getElementById('vor-next').disabled = false, VOR_MS);
+}
+
+// ---- Recall marking: 3 spoken words + 2 decoys, shuffled ----
+const RECALL_DECOYS = ["chair", "blue"];
+let checkWords = [];
+let marks = []; // in-memory only
+
+const shuffle = a => [...a].sort(() => Math.random() - 0.5);
+
+function startRecallMarking() {
+  const real = shuffle(RECALL_WORDS).slice(0, 3);
+  checkWords = shuffle([...real, ...RECALL_DECOYS]);
+  marks = Array(checkWords.length).fill(null);
+  const slotsEl = document.getElementById('slots');
+  slotsEl.innerHTML = '';
+  checkWords.forEach((w, i) => {
+    const row = document.createElement('div');
+    row.className = 'slot';
+    row.innerHTML = `<span class="word">${w}</span>
+      <span class="toggles">
+        <button onclick="mark(${i}, true, this)">Heard</button>
+        <button onclick="mark(${i}, false, this)">Not heard</button>
+      </span>`;
+    slotsEl.appendChild(row);
+  });
+  document.getElementById('submit-btn').disabled = true;
+  show('recall-marking');
+  speak("Which of these words did you hear?");
+}
+
+function mark(i, correct, btn) {
+  marks[i] = correct;
+  const [c, x] = btn.parentElement.children;
+  c.classList.toggle('sel-correct', correct);
+  x.classList.toggle('sel-incorrect', !correct);
+  document.getElementById('submit-btn').disabled = marks.some(m => m === null);
+}
+
+function submitRecall() {
+  show('complete');
+  // TODO: send results to backend (out of scope)
+  setTimeout(resetAll, COMPLETE_MS);
+}
+
+function resetAll() {
+  ['recall-next', 'balance-next', 'pursuit-next', 'vor-next', 'submit-btn']
+    .forEach(id => document.getElementById(id).disabled = true);
+  document.getElementById('wave').classList.add('idle');
+  show('waiting');
+}
+</script>
+</body>
+</html>
