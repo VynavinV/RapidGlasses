@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RapidGlasses Screening Report</title>
+  <link rel="stylesheet" href="{{ css_url }}">
+</head>
+<body>
+  <header class="site-header">
+    <div class="container header-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div>
+          <p class="brand-kicker">Hack the 6ix 2026 · Sideline Screening</p>
+          <h1>RapidGlasses Assessment Report</h1>
+        </div>
+      </div>
+      <div class="session-meta">
+        <p><span class="label">Session</span> {{ data.session_id or "—" }}</p>
+        <p><span class="label">Assessed</span> {{ assessed_at_display }}</p>
+        {% if data.patient_label %}
+        <p><span class="label">Participant</span> {{ data.patient_label }}</p>
+        {% endif %}
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="disclaimer" role="note">
+      <strong>Important:</strong> This device does not provide a medical diagnosis.
+      Results support sideline triage only and must be interpreted by a qualified
+      healthcare professional.
+    </section>
+
+    <section class="outcome-banner outcome-{{ outcome_class }}">
+      <div class="outcome-copy">
+        <p class="outcome-label">Screening Result</p>
+        <h2>{{ outcome.headline }}</h2>
+        <p class="outcome-sub">
+          {% if outcome.cleared_to_play %}
+          Cleared to return to play: <strong>Yes</strong>
+          {% else %}
+          Cleared to return to play: <strong>No</strong> — this screening alone does not clear the athlete.
+          {% endif %}
+        </p>
+      </div>
+      <div class="scat5-card">
+        <p class="scat5-label">SCAT5 Severity Scale</p>
+        <p class="scat5-score">
+          <span>{{ outcome.scat5_score | default("—") }}</span>
+          <small>/ {{ outcome.scat5_max | default(132) }}</small>
+        </p>
+        <p class="scat5-note">Higher scores indicate greater symptom burden on the scale.</p>
+      </div>
+    </section>
+
+    <section class="summary-grid">
+      <article class="card">
+        <h3>Gate Decision</h3>
+        <p class="metric-value">{{ outcome.gate_decision | default("—") | replace("_", " ") | title }}</p>
+        <p class="metric-caption">
+          Stage 3 secondary battery
+          {% if outcome.stage3_triggered %}was{% else %}was not{% endif %}
+          required.
+        </p>
+      </article>
+      <article class="card">
+        <h3>Assessment Duration</h3>
+        <p class="metric-value">
+          {% if data.assessment_duration_seconds %}
+          {{ (data.assessment_duration_seconds // 60) | int }}m {{ (data.assessment_duration_seconds % 60) | int }}s
+          {% else %}
+          —
+          {% endif %}
+        </p>
+        <p class="metric-caption">End-to-end capture and fusion window.</p>
+      </article>
+      <article class="card">
+        <h3>Fusion Composite</h3>
+        <p class="metric-value">
+          {% if fusion.weighted_composite is defined %}
+          {{ "%.1f"|format(fusion.weighted_composite) }}
+          {% else %}
+          —
+          {% endif %}
+        </p>
+        <p class="metric-caption">{{ fusion.decision_basis or "Weighted Stage 1 + Stage 3 metrics." }}</p>
+      </article>
+    </section>
+
+    {% set anisocoria = hard_overrides.get("anisocoria", {}) %}
+    {% set vor_severe = hard_overrides.get("vor_severe", {}) %}
+    {% if anisocoria.get("triggered") or vor_severe.get("triggered") %}
+    <section class="override-panel">
+      <h3>Hard Override Flags</h3>
+      <ul>
+        {% if anisocoria.get("triggered") %}
+        <li>
+          <strong>Anisocoria:</strong>
+          {{ anisocoria.asymmetry_mm }} mm asymmetry
+          (threshold {{ anisocoria.threshold_mm }} mm).
+          Urgent referral regardless of other scores.
+        </li>
+        {% endif %}
+        {% if vor_severe.get("triggered") %}
+        <li>
+          <strong>Severe VOR deviation:</strong>
+          gaze variance ratio {{ vor_severe.gaze_variance_ratio }}
+          exceeded threshold {{ vor_severe.threshold_ratio }}.
+        </li>
+        {% endif %}
+      </ul>
+    </section>
+    {% endif %}
+
+    <section class="narration card">
+      <h3>Plain-Language Summary</h3>
+      <p>{{ narration.summary or "No narrative summary was provided for this session." }}</p>
+      {% if narration.recommendations %}
+      <h4>Recommendations</h4>
+      <ul class="recommendations">
+        {% for item in narration.recommendations %}
+        <li>{{ item }}</li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </section>
+
+    <section class="metrics-section">
+      <div class="section-heading">
+        <h2>Stage 1 — Primary Metrics</h2>
+        <p>Pupil tracking, blink dynamics, optional PLR, and Presage HR/HRV.</p>
+      </div>
+
+      <div class="metric-grid">
+        {% set pupil = stage1.get("pupil", {}) %}
+        <article class="metric-card status-{{ status_class(pupil.status) }}">
+          <header>
+            <h3>Pupil Diameter</h3>
+            <span class="status-pill">{{ pupil.status | default("—") | replace("_", " ") }}</span>
+          </header>
+          <dl>
+            <div><dt>Left mean</dt><dd>{{ pupil.left_mean_mm | default("—") }} mm</dd></div>
+            <div><dt>Right mean</dt><dd>{{ pupil.right_mean_mm | default("—") }} mm</dd></div>
+            <div><dt>Left variance</dt><dd>{{ pupil.left_variance | default("—") }}</dd></div>
+            <div><dt>Right variance</dt><dd>{{ pupil.right_variance | default("—") }}</dd></div>
+          </dl>
+        </article>
+
+        {% set blink = stage1.get("blink", {}) %}
+        <article class="metric-card status-{{ status_class(blink.status) }}">
+          <header>
+            <h3>Blink Dynamics</h3>
+            <span class="status-pill">{{ blink.status | default("—") | replace("_", " ") }}</span>
+          </header>
+          <dl>
+            <div><dt>Rate</dt><dd>{{ blink.rate_per_minute | default("—") }} / min</dd></div>
+            <div><dt>Mean duration</dt><dd>{{ blink.mean_duration_ms | default("—") }} ms</dd></div>
+            <div><dt>Reference band</dt><dd>{{ blink.reference_rate_min | default("—") }}–{{ blink.reference_rate_max | default("—") }} / min</dd></div>
+          </dl>
+        </article>
+
+        {% set plr = stage1.get("plr", {}) %}
+        <article class="metric-card status-{{ status_class(plr.status) }}">
+          <header>
+            <h3>Pupillary Light Response</h3>
+            <span class="status-pill">{{ plr.status | default("—") | replace("_", " ") }}</span>
+          </header>
+          <dl>
+            <div><dt>Stimulus used</dt><dd>{{ "Yes" if plr.stimulus_used else "No" }}</dd></div>
+            <div><dt>Amplitude</dt><dd>{{ plr.amplitude_percent | default("—") }}%</dd></div>
+            <div><dt>Reference minimum</dt><dd>{{ plr.reference_min_percent | default("—") }}%</dd></div>
+          </dl>
+        </article>
+
+        {% set hrv = stage1.get("hrv", {}) %}
+        <article class="metric-card status-{{ status_class(hrv.status) }}">
+          <header>
+            <h3>Heart Rate / HRV</h3>
+            <span class="status-pill">{{ hrv.status | default("—") | replace("_", " ") }}</span>
+          </header>
+          <dl>
+            <div><dt>Heart rate</dt><dd>{{ hrv.heart_rate_bpm | default("—") }} bpm</dd></div>
+            <div><dt>RMSSD</dt><dd>{{ hrv.hrv_rmssd_ms | default("—") }} ms</dd></div>
+            <div><dt>Source</dt><dd>{{ hrv.source | default("Presage") }}</dd></div>
+          </dl>
+        </article>
+      </div>
+
+      {% if stage1.stage1_composite_score is defined %}
+      <p class="stage-score">
+        Stage 1 composite:
+        <strong>{{ stage1.stage1_composite_score }}</strong>
+        {% if stage1.stage1_max_score %} / {{ stage1.stage1_max_score }}{% endif %}
+      </p>
+      {% endif %}
+    </section>
+
+    {% if outcome.stage3_triggered %}
+    <section class="metrics-section">
+      <div class="section-heading">
+        <h2>Stage 3 — Secondary Battery</h2>
+        <p>Balance, smooth pursuit, VOR, and delayed word recall.</p>
+      </div>
+
+      <div class="metric-grid">
+        {% set balance = stage3.get("balance", {}) %}
+        <article class="metric-card status-{{ status_class(balance.status) }}">
+          <header>
+            <h3>Balance</h3>
+            <span class="status-pill">{{ balance.status | default("—") | replace("_", " ") }}</span>
+          </header>
+          <dl>
+            <div><dt>Sway magnitude</dt><dd>{{ balance.sway_magnitude_px | default("—") }} px</dd></div>
+            <div><dt>Sway frequency</dt><dd>{{ balance.sway_frequency_hz | default("—") }} Hz</dd></div>
+            <div><dt>Threshold</dt><dd>{{ balance.threshold_magnitude_px | default("—") }} px</dd></div>
+          </dl>
+        </article>
+
+        {% set pursuit = stage3.get("smooth_pursuit", {}) %}
+        <article class="metric-card status-{{ status_class(pursuit.status) }}">
+          <header>
+            <h3>Smooth Pursuit</h3>
+            <span class="status-pill">{{ pursuit.status | default("—") | replace("_", " ") }}</span>
+          </header>
+          <dl>
+            <div><dt>Horizontal correlation</dt><dd>{{ pursuit.horizontal_correlation | default("—") }}</dd></div>
+            <div><dt>Vertical correlation</dt><dd>{{ pursuit.vertical_correlation | default("—") }}</dd></div>
+            <div><dt>Minimum threshold</dt><dd>{{ pursuit.threshold_min | default("—") }}</dd></div>
+          </dl>
+        </article>
+
+        {% set vor = stage3.get("vor", {}) %}
+        <article class="metric-card status-{{ status_class(vor.status) }}">
+          <header>
+            <h3>Vestibulo-Ocular Reflex</h3>
+            <span class="status-pill">{{ vor.status | default("—") | replace("_", " ") }}</span>
+          </header>
+          <dl>
+            <div><dt>Static gaze variance</dt><dd>{{ vor.static_gaze_variance | default("—") }}</dd></div>
+            <div><dt>Motion gaze variance</dt><dd>{{ vor.motion_gaze_variance | default("—") }}</dd></div>
+            <div><dt>Variance ratio</dt><dd>{{ vor.variance_ratio | default("—") }}</dd></div>
+          </dl>
+        </article>
+
+        {% set recall = stage3.get("recall", {}) %}
+        <article class="metric-card status-neutral">
+          <header>
+            <h3>Delayed Recall</h3>
+            <span class="status-pill">{{ recall.score | default("—") }} / {{ recall.max_score | default(5) }}</span>
+          </header>
+          <dl>
+            <div><dt>Words presented</dt><dd>{{ recall.words_presented | join(", ") if recall.words_presented else "—" }}</dd></div>
+            <div><dt>Words recalled</dt><dd>{{ recall.words_recalled | join(", ") if recall.words_recalled else "—" }}</dd></div>
+            <div><dt>Scoring</dt><dd>{{ recall.scoring_method | default("—") | replace("_", " ") }}</dd></div>
+          </dl>
+        </article>
+      </div>
+
+      {% if stage3.stage3_composite_score is defined %}
+      <p class="stage-score">
+        Stage 3 composite:
+        <strong>{{ stage3.stage3_composite_score }}</strong>
+        {% if stage3.stage3_max_score %} / {{ stage3.stage3_max_score }}{% endif %}
+      </p>
+      {% endif %}
+    </section>
+    {% endif %}
+
+    {% if metadata.devices %}
+    <section class="footer-meta">
+      <h3>Capture Devices</h3>
+      <ul>
+        {% for name, device in metadata.devices.items() %}
+        <li><span>{{ name | replace("_", " ") | title }}</span> {{ device }}</li>
+        {% endfor %}
+      </ul>
+      {% if metadata.report_version %}
+      <p class="version">Report schema v{{ metadata.report_version }}</p>
+      {% endif %}
+    </section>
+    {% endif %}
+  </main>
+
+  <footer class="site-footer">
+    <div class="container">
+      <p>Read-only hospital reference copy. Do not use as sole basis for return-to-play decisions.</p>
+    </div>
+  </footer>
+</body>
+</html>
