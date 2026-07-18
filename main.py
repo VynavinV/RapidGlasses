@@ -1,124 +1,168 @@
+"""RapidGlasses eye tracker.
+
+PuRe-style pupil detection (the algorithm class used by robust open-source
+eye trackers): normalize lighting, remove specular glints, detect edges,
+fit ellipses to edge segments, and score each candidate by how pupil-like it
+is (round, closed, dark interior, bright surround). A Kalman filter smooths
+the pupil center for stable gaze tracking. Overlays show pupil dilation and
+gaze deviation.
+"""
 import cv2
 import numpy as np
 from collections import deque
 
 STREAM_URL = "http://10.94.64.101:81/stream"
 
-# ---------------- tuning ----------------
-DARK_PERCENTILE = 8      # pupil pixels are within the darkest N% of the eye
-MIN_R = 8                # min pupil radius (px)
-MAX_R = 120              # max pupil radius (px)
-TRAIL_LEN = 60
-DILATION_HISTORY = 200   # samples in the live dilation graph
-GLINT_W = 0.35           # how strongly the glint prior pulls candidate scoring
+# ---------------- detection tuning ----------------
+GLINT_THRESH = 180       # brightness above which a spot is treated as glint
+MIN_AREA = 150           # min pupil contour area (px^2)
+MAX_AREA_FRAC = 0.4      # reject blobs bigger than this frac of the frame
+MIN_ASPECT = 0.45        # min minor/major axis ratio (roundness)
+MIN_FIT = 0.55           # min contour<->ellipse area agreement
+MIN_CONTRAST = 8         # pupil interior must be this much darker than around
 
+# ---------------- tracking / display ----------------
+TRAIL_LEN = 50
+DILATION_HISTORY = 180
 FONT = cv2.FONT_HERSHEY_SIMPLEX
+GREEN, CYAN, AMBER, GRAY = (0, 255, 120), (0, 255, 255), (0, 180, 255), (150, 150, 150)
 
 
-# ---------------- Kalman: [x, y, vx, vy] tracking the pupil center ----------
 def make_kalman():
     kf = cv2.KalmanFilter(4, 2)
-    kf.transitionMatrix = np.array([[1, 0, 1, 0],
-                                    [0, 1, 0, 1],
-                                    [0, 0, 1, 0],
-                                    [0, 0, 0, 1]], np.float32)
-    kf.measurementMatrix = np.array([[1, 0, 0, 0],
-                                    [0, 1, 0, 0]], np.float32)
+    kf.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1],
+                                    [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)
+    kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
     kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
-    kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.5
+    kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.4
     return kf
 
 
-def find_glint(gray, mask=None):
-    """Brightest small specular spot -> location prior for the pupil."""
-    g = cv2.GaussianBlur(gray, (5, 5), 0)
-    if mask is not None:
-        g = cv2.bitwise_and(g, g, mask=mask)
-    _, mx, _, loc = cv2.minMaxLoc(g)
-    if mx < 200:                     # no strong specular highlight
-        return None
-    return loc
-
-
-def score_candidate(c, gray, glint):
-    """Score a contour as 'pupil-ness': dark, round, sharp edge, near glint."""
-    area = cv2.contourArea(c)
-    if area < np.pi * MIN_R ** 2 or area > np.pi * MAX_R ** 2:
-        return None
-    peri = cv2.arcLength(c, True)
-    if peri == 0:
-        return None
-    circ = 4 * np.pi * area / (peri * peri)      # 1.0 = perfect circle
-    if circ < 0.55:                              # reject eyelid/lash shadows
-        return None
-
-    (x, y), r = cv2.minEnclosingCircle(c)
-    x, y, r = int(x), int(y), int(r)
-
-    # mean darkness inside the blob (darker = better)
-    blob = np.zeros(gray.shape, np.uint8)
-    cv2.drawContours(blob, [c], -1, 255, -1)
-    inside = cv2.mean(gray, mask=blob)[0]
-
-    # edge contrast: iris ring just outside should be much brighter than inside
-    ring = np.zeros(gray.shape, np.uint8)
-    cv2.circle(ring, (x, y), int(r * 1.6), 255, -1)
-    cv2.circle(ring, (x, y), int(r * 1.1), 0, -1)
-    outside = cv2.mean(gray, mask=ring)[0]
-    contrast = max(0.0, outside - inside)        # bigger = crisper pupil edge
-
-    # glint proximity prior
-    if glint is not None:
-        d = np.hypot(x - glint[0], y - glint[1])
-        prox = np.exp(-d / (r + 1e-3))           # ~1 when glint is inside pupil
-    else:
-        prox = 0.0
-
-    darkness = (255 - inside) / 255.0
-    score = darkness * circ * (contrast / 255.0 + 0.15) * (1 + GLINT_W * prox)
-    return score, c
-
-
-def detect_pupil(gray, glint):
-    """Return fitted ellipse ((cx,cy),(MA,ma),ang) for the best pupil, or None."""
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+def detect_pupil(gray):
+    """PuRe-style pupil detection -> (ellipse, glint) or (None, glint)."""
+    h, w = gray.shape
+    clahe = cv2.createCLAHE(3.0, (8, 8))
     eq = clahe.apply(gray)
-    blur = cv2.GaussianBlur(eq, (7, 7), 0)
+    blur = cv2.medianBlur(eq, 5)
 
-    thr = np.percentile(blur, DARK_PERCENTILE)   # adaptive dark cutoff
-    _, mask = cv2.threshold(blur, int(thr), 255, cv2.THRESH_BINARY_INV)
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
+    # locate + remove specular glints so they don't break the pupil edge
+    _, glint_mask = cv2.threshold(blur, GLINT_THRESH, 255, cv2.THRESH_BINARY)
+    glint_mask = cv2.dilate(glint_mask, np.ones((5, 5), np.uint8))
+    filled = cv2.inpaint(blur, glint_mask, 5, cv2.INPAINT_TELEA)
 
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    edges = cv2.Canny(filled, 30, 90)
+    edges = cv2.dilate(edges, np.ones((2, 2), np.uint8))
+
+    cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    frame_area = h * w
     best = None
     for c in cnts:
-        s = score_candidate(c, eq, glint)
-        if s is None:
+        if len(c) < 5:
             continue
-        if best is None or s[0] > best[0]:
-            best = s
-    if best is None or len(best[1]) < 5:
-        return None
-    return cv2.fitEllipse(best[1])
+        area = cv2.contourArea(c)
+        if area < MIN_AREA or area > MAX_AREA_FRAC * frame_area:
+            continue
+        try:
+            ell = cv2.fitEllipse(c)
+        except cv2.error:
+            continue
+        (ex, ey), (MA, ma), _ = ell
+        if MA <= 0 or ma <= 0:
+            continue
+        aspect = ma / MA
+        if aspect < MIN_ASPECT:
+            continue
+        ell_area = np.pi * (MA / 2) * (ma / 2)
+        fit = min(area, ell_area) / max(area, ell_area)
+        if fit < MIN_FIT:
+            continue
+
+        cx, cy, r = int(ex), int(ey), int((MA + ma) / 4)
+        if not (0 <= cx < w and 0 <= cy < h) or r < 6:
+            continue
+        # reject candidates hugging the frame border (vignette/edge artifacts)
+        m = r + 4
+        if cx - m < 0 or cy - m < 0 or cx + m >= w or cy + m >= h:
+            continue
+
+        inner = np.zeros_like(gray)
+        cv2.circle(inner, (cx, cy), max(3, r - 3), 255, -1)
+        outer = np.zeros_like(gray)
+        cv2.circle(outer, (cx, cy), int(r * 1.8), 255, -1)
+        cv2.circle(outer, (cx, cy), int(r * 1.2), 0, -1)
+        i_mean = cv2.mean(gray, mask=inner)[0]
+        o_mean = cv2.mean(gray, mask=outer)[0]
+        contrast = o_mean - i_mean
+        if contrast < MIN_CONTRAST:
+            continue
+
+        darkness = (255 - i_mean) / 255
+        # mild center bias: pupil sits near frame middle, not jammed in a corner
+        cdist = np.hypot(cx - w / 2, cy - h / 2) / np.hypot(w / 2, h / 2)
+        center = 1.0 - 0.5 * cdist          # 1.0 at center -> 0.5 at corner
+        score = fit * aspect * (contrast / 255 + 0.1) * (0.4 + darkness) * center
+        if best is None or score > best[0]:
+            best = (score, ell)
+
+    # find the glint that lies inside the chosen pupil (for display)
+    glint = None
+    if best is not None:
+        (ex, ey), (MA, ma), _ = best[1]
+        r = (MA + ma) / 4
+        gc, _ = cv2.findContours(glint_mask, cv2.RETR_EXTERNAL,
+                                 cv2.CHAIN_APPROX_SIMPLE)
+        for c in gc:
+            m = cv2.moments(c)
+            if m["m00"] == 0:
+                continue
+            gx, gy = m["m10"] / m["m00"], m["m01"] / m["m00"]
+            if np.hypot(gx - ex, gy - ey) < r * 1.3:
+                glint = (int(gx), int(gy))
+                break
+    return (best[1] if best else None), glint
 
 
-# ---------------- HUD helpers ----------------
-def draw_dilation_graph(frame, hist, x, y, w, h):
-    cv2.rectangle(frame, (x, y), (x + w, y + h), (40, 40, 40), -1)
-    cv2.rectangle(frame, (x, y), (x + w, y + h), (90, 90, 90), 1)
+def draw_graph(canvas, hist, x, y, w, h):
+    cv2.rectangle(canvas, (x, y), (x + w, y + h), (40, 40, 40), -1)
+    cv2.rectangle(canvas, (x, y), (x + w, y + h), (90, 90, 90), 1)
     if len(hist) < 2:
         return
     lo, hi = min(hist), max(hist)
     rng = max(hi - lo, 1e-3)
-    pts = []
-    for i, v in enumerate(hist):
-        px = x + int(i / (len(hist) - 1) * w)
-        py = y + h - int((v - lo) / rng * (h - 6)) - 3
-        pts.append((px, py))
-    cv2.polylines(frame, [np.array(pts, np.int32)], False, (0, 255, 180), 1)
-    cv2.putText(frame, "DILATION", (x + 4, y - 6), FONT, 0.4, (0, 255, 180), 1)
+    pts = [(x + int(i / (len(hist) - 1) * w),
+            y + h - int((v - lo) / rng * (h - 6)) - 3)
+           for i, v in enumerate(hist)]
+    cv2.polylines(canvas, [np.array(pts, np.int32)], False, GREEN, 1)
+
+
+def build_panel(h, pw, active, diam, pct, dev, dx, dy, hist):
+    # scale HUD layout to the actual panel height so nothing overlaps
+    s = h / 240.0
+    def y(v):
+        return int(v * s)
+    fs = 0.42 * s          # small font
+    fb = 0.72 * s          # big font
+    panel = np.full((h, pw, 3), 24, np.uint8)
+    cv2.putText(panel, "EYE TRACKER", (12, y(26)), FONT, 0.5 * s, GREEN, 2)
+    cv2.line(panel, (12, y(36)), (pw - 12, y(36)), (60, 60, 60), 1)
+    if active:
+        rows = [("PUPIL", f"{diam:.1f} px", GREEN),
+                ("DILATION vs base", f"{pct:+.1f} %", AMBER if pct < 0 else CYAN),
+                (f"GAZE DEV  (dx {dx:+.0f}  dy {dy:+.0f})",
+                 f"{dev:.0f} px", AMBER)]
+        yy = 56
+        for label, val, col in rows:
+            cv2.putText(panel, label, (12, y(yy)), FONT, fs, GRAY, 1)
+            cv2.putText(panel, val, (12, y(yy + 17)), FONT, fb, col, 2)
+            yy += 44
+    else:
+        cv2.putText(panel, "searching...", (12, y(56)), FONT, 0.5 * s,
+                    (0, 0, 255), 1)
+    gh = y(44)
+    gy = h - gh - y(14)
+    cv2.putText(panel, "DILATION TREND", (12, gy - y(8)), FONT, fs, GRAY, 1)
+    draw_graph(panel, list(hist), 12, gy, pw - 24, gh)
+    return panel
 
 
 def main():
@@ -128,15 +172,16 @@ def main():
         return
     print("Streaming... press ESC or 'q' to quit.")
 
-    WIN = "ESP32 Camera"
-    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)   # resizable; upscales, same res
+    WIN = "RapidGlasses Eye Tracker"
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WIN, 1280, 720)
 
     kf = make_kalman()
-    initialized = False
+    inited = False
+    miss = 0
     trail = deque(maxlen=TRAIL_LEN)
-    dil_hist = deque(maxlen=DILATION_HISTORY)
-    baseline = None          # rolling baseline diameter for %-change readout
+    hist = deque(maxlen=DILATION_HISTORY)
+    baseline = None
 
     while True:
         ret, frame = cap.read()
@@ -148,88 +193,66 @@ def main():
         fcx, fcy = w // 2, h // 2
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        glint = find_glint(gray)
-        ell = detect_pupil(gray, glint)
+        ell, glint = detect_pupil(gray)
+        pred = kf.predict() if inited else None
 
-        # Kalman predict/update
-        pred = kf.predict() if initialized else None
-        diam = None
+        diam = pct = dev = dx = dy = 0.0
+        active = False
         if ell is not None:
-            (ecx, ecy), (MA, ma), ang = ell
+            (ex, ey), (MA, ma), ang = ell
             diam = (MA + ma) / 2.0
-            meas = np.array([[np.float32(ecx)], [np.float32(ecy)]])
-            if not initialized:
-                kf.statePost = np.array(
-                    [[ecx], [ecy], [0], [0]], np.float32)
-                initialized = True
-            # gate: reject wild jumps vs prediction
-            if pred is None or np.hypot(ecx - pred[0, 0],
-                                        ecy - pred[1, 0]) < max(MA, 60):
-                kf.correct(meas)
+            meas = np.array([[np.float32(ex)], [np.float32(ey)]])
+            if not inited:
+                kf.statePost = np.array([[ex], [ey], [0], [0]], np.float32)
+                inited = True
+                miss = 0
+            else:
+                far = np.hypot(ex - pred[0, 0], ey - pred[1, 0])
+                if far < max(diam * 1.5, 45):
+                    kf.correct(meas)              # normal update
+                    miss = 0
+                else:
+                    miss += 1                     # detection disagrees w/ lock
+                    if miss >= 4:                 # stuck -> re-acquire here
+                        kf.statePost = np.array(
+                            [[ex], [ey], [0], [0]], np.float32)
+                        trail.clear()
+                        miss = 0
 
-        dx = dy = dev = pct = 0.0
-        if initialized:
-            state = kf.statePost
-            cx, cy = float(state[0, 0]), float(state[1, 0])
+        if inited:
+            active = True
+            cx = float(kf.statePost[0, 0])
+            cy = float(kf.statePost[1, 0])
             icx, icy = int(cx), int(cy)
             trail.append((icx, icy))
 
-            # --- draw pupil ellipse (bold lock on the eye) ---
             if ell is not None:
-                cv2.ellipse(frame, ((cx, cy), (MA, ma), ang),
-                            (0, 255, 120), 2)
+                cv2.ellipse(frame, ((cx, cy), (MA, ma), ang), GREEN, 2)
                 cv2.circle(frame, (icx, icy), 3, (0, 0, 255), -1)
+                if glint is not None:
+                    cv2.circle(frame, glint, 4, CYAN, 1)
 
-            # --- glint ---
-            if glint is not None:
-                cv2.circle(frame, glint, 5, (0, 255, 255), 1)
-
-            # --- gaze / deviation vector from center ---
             dx, dy = cx - fcx, cy - fcy
             dev = float(np.hypot(dx, dy))
-            cv2.drawMarker(frame, (fcx, fcy), (180, 180, 180),
-                           cv2.MARKER_CROSS, 16, 1)
-            cv2.arrowedLine(frame, (fcx, fcy), (icx, icy),
-                            (0, 180, 255), 1, tipLength=0.15)
-
-            # --- motion trail (fading) ---
+            cv2.drawMarker(frame, (fcx, fcy), GRAY, cv2.MARKER_CROSS, 16, 1)
+            cv2.arrowedLine(frame, (fcx, fcy), (icx, icy), AMBER, 1,
+                            tipLength=0.18)
             for i in range(1, len(trail)):
                 cv2.line(frame, trail[i - 1], trail[i], (255, 160, 0), 1)
 
-            # --- dilation tracking ---
-            if diam is not None:
-                dil_hist.append(diam)
+            if ell is not None:
+                hist.append(diam)
                 baseline = diam if baseline is None else \
-                    0.98 * baseline + 0.02 * diam
+                    0.985 * baseline + 0.015 * diam
                 pct = (diam - baseline) / baseline * 100.0
 
-        # ---- HUD sidebar (never covers the eye) ----
-        pw = 240
-        panel = np.zeros((h, pw, 3), np.uint8)
-        panel[:] = (24, 24, 24)
-        cv2.putText(panel, "EYE TRACKER", (12, 30), FONT, 0.6,
-                    (0, 255, 120), 2)
-        if initialized and diam is not None:
-            cv2.putText(panel, "PUPIL", (12, 70), FONT, 0.45, (150, 150, 150), 1)
-            cv2.putText(panel, f"{diam:.1f}px", (12, 98), FONT, 0.8,
-                        (0, 255, 120), 2)
-            cv2.putText(panel, "DILATION", (12, 135), FONT, 0.45,
-                        (150, 150, 150), 1)
-            col = (0, 200, 255) if pct >= 0 else (255, 160, 0)
-            cv2.putText(panel, f"{pct:+.1f}%", (12, 163), FONT, 0.8, col, 2)
-            cv2.putText(panel, "GAZE DEV", (12, 200), FONT, 0.45,
-                        (150, 150, 150), 1)
-            cv2.putText(panel, f"{dev:.0f}px", (12, 228), FONT, 0.8,
-                        (0, 180, 255), 2)
-            cv2.putText(panel, f"dx {dx:+.0f}  dy {dy:+.0f}", (12, 252),
-                        FONT, 0.45, (150, 150, 150), 1)
-        else:
-            cv2.putText(panel, "Searching...", (12, 70), FONT, 0.55,
-                        (0, 0, 255), 1)
-        draw_dilation_graph(panel, list(dil_hist), 12, h - 80, pw - 24, 60)
-
-        canvas = np.hstack([frame, panel])
-        cv2.imshow(WIN, canvas)
+        # scale the eye view up to a crisp fixed height, build HUD to match
+        disp_h = 640
+        scale = disp_h / h
+        big = cv2.resize(frame, (int(w * scale), disp_h),
+                         interpolation=cv2.INTER_NEAREST)
+        panel = build_panel(disp_h, 320, active, diam, pct, dev, dx, dy, hist)
+        cv2.imshow(WIN, np.hstack([big, panel]))
         key = cv2.waitKey(1) & 0xFF
         if key == 27 or key == ord("q"):
             break
