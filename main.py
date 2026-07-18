@@ -20,8 +20,11 @@ MAX_AREA_FRAC = 0.4      # reject blobs bigger than this frac of the frame
 MIN_ASPECT = 0.45        # min minor/major axis ratio (roundness)
 MIN_FIT = 0.55           # min contour<->ellipse area agreement
 MIN_CONTRAST = 8         # pupil interior must be this much darker than around
+MAX_INTERIOR_ABOVE_DARK = 45   # interior brightness allowed above darkest pixels
 
 # ---------------- tracking / display ----------------
+SHAPE_EMA = 0.25         # smoothing for pupil axes/angle (lower = smoother)
+ROUNDNESS = 0.6          # 0=raw ellipse, 1=force perfect circle
 TRAIL_LEN = 50
 DILATION_HISTORY = 180
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -33,14 +36,19 @@ def make_kalman():
     kf.transitionMatrix = np.array([[1, 0, 1, 0], [0, 1, 0, 1],
                                     [0, 0, 1, 0], [0, 0, 0, 1]], np.float32)
     kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
-    kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
-    kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.4
+    kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.008
+    kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.8
     return kf
 
 
-def detect_pupil(gray):
-    """PuRe-style pupil detection -> (ellipse, glint) or (None, glint)."""
+def detect_pupil(gray, prior=None):
+    """PuRe-style pupil detection -> (ellipse, glint).
+
+    prior: (x, y) last known pupil center; nearby candidates are favored.
+    """
     h, w = gray.shape
+    # absolute darkness reference: pupil interior sits near the darkest pixels
+    dark_ref = np.percentile(gray, 3)
     clahe = cv2.createCLAHE(3.0, (8, 8))
     eq = clahe.apply(gray)
     blur = cv2.medianBlur(eq, 5)
@@ -95,12 +103,22 @@ def detect_pupil(gray):
         contrast = o_mean - i_mean
         if contrast < MIN_CONTRAST:
             continue
+        # absolute-darkness gate: interior must be close to the darkest pixels.
+        # a real pupil is genuinely dark; eyelid creases/lash shadows are mid-gray
+        if i_mean > dark_ref + MAX_INTERIOR_ABOVE_DARK:
+            continue
 
-        darkness = (255 - i_mean) / 255
-        # mild center bias: pupil sits near frame middle, not jammed in a corner
-        cdist = np.hypot(cx - w / 2, cy - h / 2) / np.hypot(w / 2, h / 2)
-        center = 1.0 - 0.5 * cdist          # 1.0 at center -> 0.5 at corner
-        score = fit * aspect * (contrast / 255 + 0.1) * (0.4 + darkness) * center
+        # darkness weighted hard (^3) so the true pupil dominates smudges
+        darkness = max(0.0, (255 - i_mean) / 255) ** 3
+        size = min(1.0, r / 30.0)           # bigger blob favored (up to r=30)
+        if prior is not None:               # temporal lock: stay near last pupil
+            pd = np.hypot(cx - prior[0], cy - prior[1])
+            locality = np.exp(-pd / 40.0)   # ~1 near prior, decays over ~40px
+        else:                               # cold start: gentle center bias
+            cdist = np.hypot(cx - w / 2, cy - h / 2) / np.hypot(w / 2, h / 2)
+            locality = 1.0 - 0.4 * cdist
+        score = (fit * aspect * (contrast / 255 + 0.1)
+                 * (0.2 + darkness) * (0.4 + size) * (0.3 + locality))
         if best is None or score > best[0]:
             best = (score, ell)
 
@@ -182,6 +200,7 @@ def main():
     trail = deque(maxlen=TRAIL_LEN)
     hist = deque(maxlen=DILATION_HISTORY)
     baseline = None
+    shape = None            # smoothed (MA, ma, sin2a, cos2a)
 
     while True:
         ret, frame = cap.read()
@@ -193,14 +212,27 @@ def main():
         fcx, fcy = w // 2, h // 2
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        ell, glint = detect_pupil(gray)
+        prior = (float(kf.statePost[0, 0]), float(kf.statePost[1, 0])) \
+            if inited else None
+        ell, glint = detect_pupil(gray, prior)
         pred = kf.predict() if inited else None
 
         diam = pct = dev = dx = dy = 0.0
         active = False
         if ell is not None:
             (ex, ey), (MA, ma), ang = ell
-            diam = (MA + ma) / 2.0
+            # pull axes toward a circle (pupils are near-round; kills flipping)
+            avg = (MA + ma) / 2.0
+            MA = MA + (avg - MA) * ROUNDNESS
+            ma = ma + (avg - ma) * ROUNDNESS
+            # EMA-smooth shape; angle via sin/cos(2a) to avoid 180-deg wrap jumps
+            a2 = np.radians(2 * ang)
+            meas_shape = (MA, ma, np.sin(a2), np.cos(a2))
+            if shape is None:
+                shape = meas_shape
+            else:
+                shape = tuple(o + (n - o) * SHAPE_EMA
+                              for o, n in zip(shape, meas_shape))
             meas = np.array([[np.float32(ex)], [np.float32(ey)]])
             if not inited:
                 kf.statePost = np.array([[ex], [ey], [0], [0]], np.float32)
@@ -226,8 +258,11 @@ def main():
             icx, icy = int(cx), int(cy)
             trail.append((icx, icy))
 
-            if ell is not None:
-                cv2.ellipse(frame, ((cx, cy), (MA, ma), ang), GREEN, 2)
+            if shape is not None:
+                sMA, sma, s2, c2 = shape
+                sang = np.degrees(np.arctan2(s2, c2)) / 2.0
+                diam = (sMA + sma) / 2.0
+                cv2.ellipse(frame, ((cx, cy), (sMA, sma), sang), GREEN, 2)
                 cv2.circle(frame, (icx, icy), 3, (0, 0, 255), -1)
                 if glint is not None:
                     cv2.circle(frame, glint, 4, CYAN, 1)
@@ -240,7 +275,7 @@ def main():
             for i in range(1, len(trail)):
                 cv2.line(frame, trail[i - 1], trail[i], (255, 160, 0), 1)
 
-            if ell is not None:
+            if shape is not None:
                 hist.append(diam)
                 baseline = diam if baseline is None else \
                     0.985 * baseline + 0.015 * diam
