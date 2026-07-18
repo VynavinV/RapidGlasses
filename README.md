@@ -14,6 +14,18 @@
 
 **The proposed solution:** a wearable/tablet device that runs a short, mostly self-administered battery of standard neuro exam components — vestibular/ocular (VOR), smooth pursuit, static balance, and short-term verbal recall — using onboard cameras (eye + head tracking) and voice (TTS instructions, spoken memory words), producing an objective, timestamped record close to the time of injury.
 
+**The staged pipeline, as `report_data.json` (§4.10) reveals it:**
+
+`report_data.json` — the sample payload for the new report viewer — is the clearest single artifact in the repo for understanding the *intended* end-to-end architecture, because it's the first place a Stage 1/Stage 3 data contract and a fusion/gating decision actually get written down anywhere. From it:
+
+1. **Stage 1 — passive/quick primary screen.** Pupil diameter + variance (glasses IR eye camera), blink rate/duration, an optional pupillary light response (PLR) test, and heart rate / HRV from a device called **"Presage"** (referenced as `hrv.source: "Presage (laptop)"` — not implemented anywhere in this repo; treat as an external hardware/software integration to track down, not something to build from scratch). Produces a `stage1_composite_score`.
+2. **Gate decision.** Stage 1's composite score (plus two **hard override** checks — anisocoria and severe VOR, see §4.10) decides whether the assessment can stop at Stage 1 ("clear") or must escalate to Stage 3 ("ambiguous"/ refer). This is the `outcome.gate_decision` field and is the actual reason `index.html` is titled "Stage 3 Assessment" — it's the escalation path, not the whole product.
+3. **Stage 3 — secondary battery.** This is the one currently implemented as `index.html` + `tracking.py`: Balance, Smooth Pursuit, VOR, and delayed word Recall. Produces a `stage3_composite_score`.
+4. **Fusion.** A weighted combination of Stage 1 and Stage 3 composites (`fusion.stage1_weight` / `stage3_weight` / `weighted_composite`) plus the hard overrides produces a final `outcome.flag` (`"refer"` or presumably `"clear"`) and a **SCAT5-style severity score** (`outcome.scat5_score` / `scat5_max`, out of 132 — this is the standard clinical symptom-severity scale for concussion, so the product is explicitly trying to map its own composite onto a recognized clinical instrument).
+5. **Report.** The fusion node's final output is rendered as a read-only HTML report (`report.py` / `report.html` / `style.css`, §4.10) — this is meant to be the artifact a hospital or clinician actually looks at.
+
+**This means "Stage 1", "Stage 2" (fusion/gating — no dedicated files yet, likely meant to live in a "fusion node," possibly the empty `vitals-server/`), and "Stage 3" are not vague — they now have a concrete data shape via `report_data.json`.** Nothing in the repo currently *produces* a `report_data.json`-shaped payload from a live assessment; it's currently a hand-authored sample fixture the report server reads. Wiring `index.html`'s Stage 3 results (and a real Stage 1 capture pipeline) into that shape is the central unification task — see §6.8 and §8.
+
 This repo currently contains **prototype pieces of that device's software**, built independently and not yet wired together end-to-end.
 
 ---
@@ -27,8 +39,12 @@ RapidGlasses/
 ├── tracking.py             Flask Blueprint: head-sway tracking (MediaPipe FaceLandmarker) — imported by secondcheck.py
 ├── main.py                 NOT a Flask app — standalone OpenCV CLI: PuRe-style pupil/eye tracker (see §6.1, §6.2 — naming trap)
 ├── calibrate.py            Standalone CLI tool: grab one frame from an ESP32 eye-cam stream, dump pixel stats
-├── requirements.txt         Python deps: flask, flask-cors, requests, python-dotenv, opencv-python, mediapipe
-├── SETUP.md                 Human-written onboarding doc (source of truth for local run instructions)
+├── report.py                A THIRD, separate Flask app (its own process, port 8080) — serves the read-only clinician-facing report
+├── report.html              Jinja2 template rendered by report.py — the actual report layout
+├── report_data.json          Hand-authored SAMPLE payload report.py reads — no real pipeline writes this file yet (see §4.10)
+├── style.css                 Stylesheet for report.html, served as a static file by report.py
+├── requirements.txt         Python deps: flask, flask-cors, requests, python-dotenv, opencv-python, mediapipe (jinja2 comes in transitively via flask)
+├── SETUP.md                 Human-written onboarding doc (source of truth for local run instructions) — NOT yet updated for report.py, see §6.9
 ├── models/
 │   └── face_landmarker.task   MediaPipe FaceLandmarker model blob (~3.7MB), used by tracking.py
 ├── vitals-server/            EMPTY directory — placeholder, nothing implemented yet
@@ -91,9 +107,28 @@ There is **no package.json, no build tooling, no test suite, no CI config, no da
 └──────────────────────────────┘
      ▲ same stream URL used by
      └── calibrate.py (one-shot calibration/debug CLI tool, tunes main.py's thresholds)
+
+  ── Third, also-unconnected process: the clinician report viewer ──
+
+┌──────────────────────────────┐         ┌──────────────────────────────────────┐
+│   Clinician / hospital        │  HTTP   │   report.py — Flask app #2               │
+│   browser                     │────────▶│   its OWN process, port 8080             │
+│                                │         │   GET  /  and  /report → renders          │
+│                                │         │           report.html (Jinja2)             │
+│                                │         │   GET  /api/report → raw JSON               │
+└──────────────────────────────┘         └──────────────┬───────────────────────┘
+                                                            │ reads (static file, not DB)
+                                                            ▼
+                                          ┌──────────────────────────────────────┐
+                                          │  report_data.json (hand-authored        │
+                                          │  SAMPLE fixture — no real assessment    │
+                                          │  pipeline writes this file yet)         │
+                                          └──────────────────────────────────────┘
 ```
 
-**Key architectural fact:** there are **two completely separate, non-communicating tracking subsystems** in this repo. They target different cameras, run in different processes, and neither imports the other (see §6.1). `main.py` — despite the name — holds the pupil/eye tracker, a standalone `cv2` desktop app with no Flask involvement; `tracking.py` holds the head-sway Blueprint that's actually wired into the running server via `secondcheck.py`.
+**Key architectural fact #1:** there are **two completely separate, non-communicating tracking subsystems** in this repo. They target different cameras, run in different processes, and neither imports the other (see §6.1). `main.py` — despite the name — holds the pupil/eye tracker, a standalone `cv2` desktop app with no Flask involvement; `tracking.py` holds the head-sway Blueprint that's actually wired into the running server via `secondcheck.py`.
+
+**Key architectural fact #2:** there are now **three separate Flask apps / processes** in this repo, none of which talk to each other over HTTP or share any in-memory state: `secondcheck.py` (port 3001, the assessment-runtime server), `report.py` (port 8080, the read-only report viewer), and conceptually a not-yet-built "fusion node" that would sit between them (see §1). The only thing connecting Stage 3 (`index.html`/`secondcheck.py`) to the report (`report.py`) today is that they'd need to agree on the `report_data.json` schema — nothing currently writes that file from a live run.
 
 ---
 
@@ -312,9 +347,53 @@ This directory (a `git filter-repo`/history-rewrite scratch dir containing a `t/
 
 ---
 
+### 4.10 `report.py` / `report.html` / `style.css` / `report_data.json` — the clinician-facing report viewer
+
+**Role:** A **separate, standalone Flask app** — its own process, its own port (`8080`, vs. `secondcheck.py`'s `3001`) — that renders a read-only, print-friendly HTML report summarizing a completed assessment. This is the newest addition to the repo and is the best current evidence of what the *finished* data pipeline is meant to produce (see the staged-pipeline breakdown in §1). It does not import or share any code with `secondcheck.py`, `tracking.py`, or `main.py`.
+
+**`report.py` — the Flask app:**
+- `app = Flask(__name__, template_folder=BASE_DIR, static_folder=BASE_DIR, static_url_path="")` — templates and static files (`style.css`) both served from repo root, not a conventional `templates/`/`static/` subfolder split. Keep this in mind if the repo is ever restructured into subdirectories — moving `report.html` or `style.css` into a subfolder will break this config unless `template_folder`/`static_folder` are updated too.
+- `load_report_data()`: reads `report_data.json` from disk on every request (no caching, no DB). Returns HTTP `503` if the file doesn't exist yet ("assessment pipeline has not written report_data.json" — this is the exact error a fresh clone or an un-run pipeline will hit), `500` on invalid JSON or a non-object JSON root.
+- `format_timestamp(raw)`: parses an ISO 8601 string (handling a trailing `Z` by rewriting to `+00:00`) into a human-readable `"July 18, 2026 at 03:04 PM"`-style string for display; falls back to the raw string on parse failure.
+- `status_class(status)`: maps a free-text status string (e.g. `"elevated_variance"`, `"borderline"`, `"normal"`) to one of four CSS-facing buckets — `good`, `warn`, `alert`, `neutral` — via fixed string-membership sets. **This mapping is the closest thing in the repo to defined clinical thresholds for what counts as normal/borderline/concerning** — anyone building a real scoring/fusion engine should look here first for the vocabulary already in use, and should keep `report_data.json`'s status strings within these known sets (an unrecognized status string silently falls through to `"neutral"`, no error).
+
+**Routes:**
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/` and `/report` | Renders `report.html` with the loaded JSON data + computed template context (formatted timestamp, outcome CSS class, `status_class` passed in as a callable so the template can call it inline) |
+| `GET` | `/api/report` | Returns the raw `report_data.json` contents as JSON — a machine-readable mirror of the same data |
+
+**Run:** `python report.py` — starts Flask's dev server with `debug=True` on `0.0.0.0:8080` (note: `debug=True` and `host="0.0.0.0"` together is a dev-only combination — Flask's debugger allows arbitrary code execution if reachable from the network, so this must not ship as-is to anything beyond a local/trusted demo environment; see §6.10).
+
+**`report_data.json` — the data contract:**
+
+This is presently a **hand-authored sample/fixture**, not real pipeline output — a session for `"Athlete A"` with a `"refer"` outcome, used to develop and demo the report layout. Its shape is nonetheless the most authoritative schema reference in the repo for what a finished assessment record should look like. Top-level keys:
+
+- `session_id`, `patient_label`, `assessed_at` (ISO 8601), `assessment_duration_seconds`
+- `outcome`: `flag` (`"refer"` | presumably `"clear"`), `headline` (display text), `scat5_score`/`scat5_max` (SCAT5 clinical severity scale, out of 132), `gate_decision` (e.g. `"ambiguous"`), `stage3_triggered` (bool), `cleared_to_play` (bool)
+- `hard_overrides`: `anisocoria` (pupil-size asymmetry — `left_pupil_mm`, `right_pupil_mm`, `asymmetry_mm`, `threshold_mm`, `triggered`) and `vor_severe` (`gaze_variance_ratio`, `threshold_ratio`, `triggered`) — **these are meant to bypass the normal scoring/fusion path entirely**: per `report.html`'s copy, a triggered override forces "urgent referral regardless of other scores." This is a real clinical safety mechanism (anisocoria in particular is a classic acute-neurological red flag, e.g. possible intracranial pressure/herniation) and should be treated as a hard gate, not a weighted input, in any real fusion implementation.
+- `stage1`: `pupil` (`left_mean_mm`, `right_mean_mm`, `left_variance`, `right_variance`, `combined_mean_mm`, `status`), `blink` (`rate_per_minute`, `mean_duration_ms`, reference range, `status`), `plr` (`stimulus_used` bool, `amplitude_percent`, `reference_min_percent`, `status`), `hrv` (`heart_rate_bpm`, `hrv_rmssd_ms`, `source` — sample says `"Presage (laptop)"`, `status`), plus `stage1_composite_score`/`stage1_max_score`
+- `stage3`: `balance` (`sway_magnitude_px`, `sway_frequency_hz`, `duration_seconds`, `threshold_magnitude_px`, `status`), `smooth_pursuit` (`horizontal_correlation`, `vertical_correlation`, `threshold_min`, `status`), `vor` (`static_gaze_variance`, `motion_gaze_variance`, `variance_ratio`, `threshold_ratio`, `status`), `recall` (`words_presented`, `words_recalled`, `score`, `max_score`, `scoring_method`), plus `stage3_composite_score`/`stage3_max_score`
+- `fusion`: `stage1_weight`, `stage3_weight`, `weighted_composite`, `decision_basis` (free text)
+- `narration`: `summary` (free-text paragraph), `recommendations` (list of strings) — currently hand-written in the sample; a real pipeline would need to either template this from the structured fields or have an LLM/rules engine generate it
+- `metadata`: `devices` (a dict of role → device description — sample values: `glasses: "ESP32-S3 IR stream"`, `laptop: "Presage HR/HRV"`, `fusion_node: "Raspberry Pi (QNX)"`, `tablet: "MacBook secondary battery"` — **this is the first place in the repo that names the intended physical hardware topology**, confirming a Raspberry Pi running QNX as the fusion/orchestration node referenced obliquely in `SETUP.md`'s "what QNX talks to" section), `report_version`
+
+**Important cross-reference:** `metadata.devices.fusion_node` confirms the "QNX" references scattered through `SETUP.md` and `tracking.py`'s docstring (`"QNX polls /tracking/snapshot"`) refer to a **Raspberry Pi running QNX** acting as the orchestration/fusion layer between the glasses, the laptop, and the tablet — this is the actual system architecture and gives a name to the thing that's supposed to eventually call `secondcheck.py`'s and `main.py`'s tracking endpoints, run the fusion logic, and write `report_data.json`. No code for this QNX/fusion node exists anywhere in this repo.
+
+**Template details (`report.html`, Jinja2):**
+- Uses `{{ x | default("—") }}` extensively so missing fields render an em-dash instead of erroring — the template is defensive against partially-populated data, which is worth preserving as a pattern once a real pipeline starts producing partial results (e.g. Stage 1 complete but Stage 3 not yet run).
+- `{% if outcome.stage3_triggered %}` gates whether the entire Stage 3 section renders — so a "cleared at Stage 1" report simply omits Balance/Pursuit/VOR/Recall.
+- The hard-override panel only renders if `anisocoria.triggered` or `vor_severe.triggered` is truthy.
+- `@media print` rules in `style.css` strip box-shadows for print output — the report is explicitly designed to be printed or exported as a hospital chart insert, not just viewed on-screen.
+
+**Not yet connected to anything:** nothing in `index.html`/`secondcheck.py`/`tracking.py`/`main.py` writes to `report_data.json`. The report viewer and the assessment runtime are two ends of a pipe with no pipe built yet — see §6.8.
+
+---
+
 ## 5. Full endpoint reference (consolidated)
 
-All endpoints below are served from **one Flask process on `localhost:3001`**, launched via `python secondcheck.py` (see §6.2 for why `main.py` is easy to mistake for the server entry point when it isn't).
+**Process 1 — the assessment runtime, `localhost:3001`**, launched via `python secondcheck.py` (see §6.2 for why `main.py` is easy to mistake for the server entry point when it isn't):
 
 | Method | Path | Module | Auth | Purpose |
 |---|---|---|---|---|
@@ -324,7 +403,15 @@ All endpoints below are served from **one Flask process on `localhost:3001`**, l
 | `POST` | `/tracking/stop` | tracking.py (Blueprint) | none | Stop tracking thread, release webcam |
 | `GET` | `/tracking/snapshot` | tracking.py (Blueprint) | none | Poll current sway/face-detection state |
 
-No authentication, no HTTPS, no rate limiting anywhere — acceptable for a `localhost`-only prototype talking to a `file://` UI on the same device, **not acceptable if this ever becomes a networked/multi-device product** (flag for the security review once real patient data is involved — HIPAA-relevant if deployed clinically in the US).
+**Process 2 — the report viewer, `localhost:8080`**, launched via `python report.py` (§4.10), entirely separate from Process 1:
+
+| Method | Path | Module | Auth | Purpose |
+|---|---|---|---|---|
+| `GET` | `/` | report.py | none | Renders the HTML report from `report_data.json` |
+| `GET` | `/report` | report.py | none | Same as `/` — alias |
+| `GET` | `/api/report` | report.py | none | Raw JSON mirror of `report_data.json` |
+
+No authentication, no HTTPS, no rate limiting anywhere on either process — acceptable for a `localhost`-only prototype talking to a `file://` UI on the same device, **not acceptable if this ever becomes a networked/multi-device product**, and especially not acceptable for `report.py` specifically, which is explicitly meant to display real patient data to a clinician (flag for the security review once real patient data is involved — HIPAA-relevant if deployed clinically in the US; see also §6.10 on `report.py`'s `debug=True` + `host="0.0.0.0"` combination).
 
 **External API dependency:**
 | Service | Used by | Auth | Notes |
@@ -347,8 +434,8 @@ Every instinct says `main.py` should be the entry point and `secondcheck.py` sou
 - Pupil dilation / gaze deviation data: only ever rendered to a local `cv2` debug window, never captured to any file or endpoint.
 - **There is no database, no results storage, no patient/session identifier, no way to compare a post-injury assessment against a prior baseline** — which is core to the stated product goal (detecting deviation from a person's normal baseline, and tracking compounding injuries over time). This is the largest gap between "what's built" and "what the product needs to do."
 
-### 6.4 No Stage 1 / Stage 2 in this repo
-`index.html`'s title ("Stage 3 Assessment") and its "Waiting for Stage 1 signal" screen imply a staged pipeline (injury detection → triage decision → assessment) that isn't present in this codebase at all. Whoever owns Stage 1/2 (impact detection sensor? manual clinician trigger?) needs to define the real signal contract that will replace the "Simulate signal" button.
+### 6.4 No Stage 1 / Stage 2 implementation in this repo (though the shape is now known)
+`index.html`'s title ("Stage 3 Assessment") and its "Waiting for Stage 1 signal" screen refer to a real staged pipeline — see §1's breakdown from `report_data.json`. Stage 1 (pupil/blink/PLR/HRV via glasses + a "Presage" device) and the gate/fusion decision that follows it are **fully described in the report data schema but have zero implementing code** anywhere in this repo. Whoever picks this up needs to: (a) find or build whatever "Presage" is, (b) build a Stage 1 capture flow analogous to `index.html`'s Stage 3 flow, and (c) implement the fusion/gating logic that decides `stage3_triggered` — none of which currently exists even as a stub. The "Simulate signal" button in `index.html` is a placeholder for the gate decision's escalation-to-Stage-3 signal.
 
 ### 6.5 Hardcoded LAN IP for the glasses' IR eye camera
 `STREAM_URL = "http://10.94.64.101:81/stream"` appears in both `calibrate.py` and `main.py`'s pupil tracker — a hardcoded local network address for the smart glasses' onboard IR eye camera (ESP32-CAM-class module). Not configurable via env var (unlike `tracking.py`'s `TRACKING_CAMERA_INDEX`/`TRACKING_MODEL_PATH` pattern for the webcam) — worth normalizing before this goes to a second physical glasses unit, since every unit will get a different DHCP-assigned IP.
@@ -359,20 +446,58 @@ The 5 recall words are hardcoded and identical on every run (`["apple", "dog", "
 ### 6.7 Dead tooling artifact removed: `.git-rewrite/`
 Confirmed tracked-but-useless and deleted from the repo (see §4.9) — a `git filter-repo`/history-rewrite scratch directory that had no relationship to the running application, just an old snapshot of source files from mid-rewrite. `git rm -r --cached` plus a filesystem delete; no source files were touched.
 
+### 6.8 `report.py` is an island — nothing feeds it real data
+`report.py` (§4.10) is a complete, working report renderer, but it reads a single static, hand-authored `report_data.json` fixture. No code anywhere — not `index.html`, not `secondcheck.py`, not `tracking.py`, not `main.py` — writes a file in that shape. To make the report real: (1) Stage 3's results in `index.html` need to actually be collected (see §6.3) and shaped into the `stage3` block of the schema instead of being discarded, (2) a Stage 1 pipeline needs to exist at all (§6.4), (3) something needs to implement the fusion/gating/hard-override logic and write the final `outcome`/`fusion`/`narration` blocks, and (4) that something needs to write to `report_data.json` (or `report.py` needs to be pointed at wherever the real pipeline lands its output — e.g. a per-session file or a database row instead of one hardcoded filename). This is the single highest-value integration task now that all the pieces (capture, scoring vocabulary via `status_class`, and rendering) individually exist.
+
+### 6.9 SETUP.md does not mention `report.py` at all
+`SETUP.md` documents how to run `secondcheck.py` and open `index.html`, but has no section for installing/running `report.py`, no mention of port `8080`, and no note that `report_data.json` must exist first (or that a fresh clone already ships the sample fixture, so `report.py` will actually work out of the box unlike the rest of the untested-integration pieces). Worth a "Report viewer" section addition next time SETUP.md is touched.
+
+### 6.10 `report.py` runs with `debug=True` on `host="0.0.0.0"`
+`app.run(host="0.0.0.0", port=8080, debug=True)` — this binds to all network interfaces (not just localhost) *and* enables Flask's interactive debugger, which is a known remote-code-execution vector if the debugger endpoint is reachable by anyone other than the developer (Werkzeug's debugger has no auth by default in many configurations). Fine for a demo on a trusted local network; must be changed (`debug=False`, and probably bind back to `127.0.0.1` unless cross-device access on the LAN is actually intended) before this is exposed anywhere less trusted, and definitely before any real patient data flows through it.
+
 ---
 
 ## 7. Summary: build status by product component
 
 | Component | Status | File(s) |
 |---|---|---|
-| Assessment UI / state machine | Built, functional | `index.html` |
+| Assessment UI / state machine (Stage 3) | Built, functional | `index.html` |
 | Spoken instructions (TTS) | Built, functional (needs API key) | `secondcheck.py` |
 | Recall memory test (verbal) | Built, but fixed word list + results discarded | `index.html` |
 | Head-sway tracking (balance/pursuit/VOR signal) | Built, functional as a service; **not consumed by the UI during tests** | `tracking.py`, `secondcheck.py` |
 | Pupil/gaze tracking (dilation, gaze deviation) | Built as a standalone desktop tool; **not networked, not integrated with anything** | `main.py` |
 | Calibration/tuning tooling | Built (manual CLI) | `calibrate.py` |
-| Results storage / persistence | **Not started** | — |
-| Stage 1/2 injury-trigger signal | **Not started** (stubbed with a manual button) | `index.html` |
+| Report viewer (clinician-facing HTML report) | Built, functional, renders real layouts — **but only from a hand-authored sample fixture** | `report.py`, `report.html`, `style.css` |
+| Report data schema | Defined (de facto, via the sample fixture) — see §4.10 | `report_data.json` |
+| Results storage / persistence | **Not started** — no DB, no per-session files, `report_data.json` is a single static fixture | — |
+| Stage 1 capture pipeline (pupil/blink/PLR/HRV via glasses + "Presage") | **Not started** — schema defined, zero implementing code, "Presage" device/integration unidentified | — |
+| Stage 2 / gate decision / fusion / hard-override logic | **Not started** — schema and thresholds partially implied by `report.py`'s `status_class()` and the sample `hard_overrides`/`fusion` blocks, but no scoring engine exists | — |
+| Pipe from Stage 3 results → `report_data.json` | **Not started** — the single highest-value integration task, see §6.8 | — |
 | Vitals ingestion | **Not started** (empty placeholder) | `vitals-server/` |
 | Baseline comparison / longitudinal tracking across injuries | **Not started** | — |
 | Auth / patient identity / HIPAA-relevant controls | **Not started** | — |
+| QNX/Raspberry Pi fusion node (physical orchestration hardware) | **Not started** — named in `report_data.json.metadata.devices.fusion_node` and `SETUP.md`'s QNX references, no code anywhere | — |
+
+---
+
+## 8. Orientation for whoever (human or AI agent) works on this next
+
+This section exists so a new contributor — especially an AI coding agent starting a fresh session with no memory of this repo — doesn't have to re-derive the facts above by reading every file from scratch. Read this section first; it links back into the detailed sections above by number.
+
+**The one-paragraph mental model:** three independent processes exist (`secondcheck.py`:3001 running the Stage 3 assessment + head-sway tracking, `main.py` a desktop-only pupil tracker with no server, `report.py`:8080 rendering a static sample report) plus a fully-specified-but-unbuilt data pipeline (Stage 1 capture → gate/fusion decision → `report_data.json`) that would connect them. Nothing currently writes real data between any of these pieces. If you're asked to "unify" or "connect" this codebase, the work is almost certainly: (a) get Stage 3 to actually record its results instead of discarding them (§6.3), (b) shape those results into the `report_data.json` schema (§4.10, §6.8), (c) figure out what Stage 1 needs to be and build a capture flow for it (§6.4), and (d) write the fusion/gating logic that ties it all together and produces the final report payload.
+
+**Fast facts an agent should not have to rediscover:**
+
+- **Run the server with `python secondcheck.py`, never `main.py`.** `main.py` is a standalone desktop pupil-tracker CLI with zero Flask code in it, despite the filename suggesting otherwise. This is the single most common wrong turn in this repo — see §6.2.
+- **Two cameras, two subsystems, never confuse them:** the **laptop/tablet webcam** feeds `tracking.py` (head-sway, nose-tip landmark, served over HTTP on `/tracking/*`). The **smart glasses' onboard IR eye camera** (MJPEG stream, hardcoded at `http://10.94.64.101:81/stream`) feeds `main.py` (pupil detection/dilation, desktop-only, no HTTP). See §6.1.
+- **Three Flask processes, three ports, no shared state:** `secondcheck.py` (3001), `report.py` (8080), and no third process yet for the not-built fusion node. None of them import from each other or share a database — moving data between them today means writing new integration code, not flipping a flag.
+- **`report_data.json` is the closest thing this repo has to an API contract.** If you need to know what fields a "finished assessment" is supposed to have, what the clinical thresholds/status vocabulary looks like (`normal`/`borderline`/`elevated`/etc. via `report.py`'s `status_class()`), or what hardware the system assumes exists (`metadata.devices`), read that file and §4.10 before inventing your own shape.
+- **"Stage 1", "Stage 2", "Stage 3" are real, specific pipeline stages**, not vague labels — see §1's full breakdown. Stage 3 (Balance/Pursuit/VOR/Recall) is the only one with implementing code. Stage 1 (pupil/blink/PLR/HRV + a device called "Presage") and Stage 2 (the gate/fusion decision) exist only as fields in `report_data.json`.
+- **"QNX" and "Presage" are real external references, not placeholders to ignore.** `metadata.devices.fusion_node` in `report_data.json` says `"Raspberry Pi (QNX)"`, matching `SETUP.md`'s "what QNX talks to" endpoint table and `tracking.py`'s docstring ("QNX polls /tracking/snapshot"). `hrv.source` says `"Presage (laptop)"`. Neither has any code in this repo — if you're asked to integrate with either, that's an external system/hardware integration task, not something to stub out casually, and it's worth explicitly asking the user what these already are (existing hardware? a vendor SDK?) before guessing.
+- **No persistence layer exists anywhere.** No database, no per-session files being written, no patient/session identity system. `report_data.json` is a single static file, not a per-session record. If a task implies "save the results" or "look up a prior baseline," that storage layer needs to be designed, not found.
+- **No tests, no CI, no build tooling, no linter config** anywhere in the repo, for either the Python or the HTML/JS side. Don't assume `npm test` or `pytest` do anything meaningful — check for their absence before relying on them, and don't invent a test framework unasked.
+- **Recall word list is hardcoded and identical every run** (`["apple", "dog", "green", "road", "seven"]` in `index.html`) — if you're asked to make the memory test more clinically rigorous, this is the spot, and per-session randomization is the obvious first fix (§6.6).
+- **Every network call in `index.html` is fire-and-forget with a swallowed catch.** TTS failures, tracking-start failures, etc. never surface an error to the user — the UI is deliberately built to never block or fail visibly on a backend hiccup. Preserve this resilience pattern (it's intentional, documented in `tracking.py`'s comments) rather than "fixing" it into throwing errors, unless the task specifically calls for surfacing failures.
+- **`report.py` has a real security issue as shipped** (`debug=True` + `host="0.0.0.0"`, §6.10) — don't copy this pattern into new server code, and flag it if asked to productionize anything.
+- **Before adding a new top-level Python file, check whether its name will collide in meaning with an existing one** — this repo already has one confirmed case (`main.py` vs `secondcheck.py`, §6.2) where filenames actively lie about their role. `server.py` / `report.py` / `tracking.py` / `main.py` (pupil tool) is the current, not-entirely-self-explanatory set; consider proposing clearer names rather than adding a fifth confusingly-named file.
+- **This README is the map, not the code.** If anything above turns out to be stale (a file moved, a route changed), trust the current source over this document and update the relevant section rather than propagating the discrepancy — see the note in each section about where the underlying facts were verified (git history, `git ls-tree`, direct file reads).
