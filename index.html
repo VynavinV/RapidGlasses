@@ -122,6 +122,7 @@
     color: var(--gray);
     border: 1px solid #d5dbe2;
   }
+  .slot .word { text-transform: capitalize; }
   .slot .toggles button.sel-correct { background: var(--blue); color: #fff; border-color: var(--blue); }
   .slot .toggles button.sel-incorrect { background: var(--gray); color: #fff; border-color: var(--gray); }
 
@@ -170,11 +171,12 @@
 <div class="screen" id="vor">
   <p class="instruction">Keep your eyes on the dot. Gently turn your head side to side.</p>
   <div class="stage"><div class="dot pacing"></div></div>
-  <div class="footer"><button id="vor-next" disabled onclick="show('recall-marking')">Next</button></div>
+  <div class="footer"><button id="vor-next" disabled onclick="startRecallMarking()">Next</button></div>
 </div>
 
 <div class="screen" id="recall-marking">
   <h1>Recall check</h1>
+  <p class="instruction">Which of these words did you hear?</p>
   <div class="slots" id="slots"></div>
   <div class="footer"><button id="submit-btn" disabled onclick="submitRecall()">Submit</button></div>
 </div>
@@ -186,13 +188,11 @@
 
 <script>
 // ---- Durations (ms) — tune here ----
-const RECALL_AUDIO_MS = 5000;
+const RECALL_FALLBACK_MS = 8000; // enable Next even if audio 'ended' never fires
 const BALANCE_MS      = 20000;
 const PURSUIT_MS      = 15000;
 const VOR_MS          = 20000;
 const COMPLETE_MS     = 4000;
-
-const WORD_COUNT = 5;
 
 // TODO: replace with MediaPipe/OpenCV head tracking — start/stop capture
 // per test in startBalance / startPursuit / startVor.
@@ -211,11 +211,28 @@ function startRecallPriming() {
   });
 }
 
-// TODO: replace with ElevenLabs API call speaking 5 words aloud.
-// Words must never be rendered as text on this screen.
+// Spoken via the local ElevenLabs proxy — never rendered as text on screen.
+const RECALL_WORDS = ["apple", "dog", "green", "road", "seven"];
+const RECALL_AUDIO_URL = 'http://localhost:3001/api/recall-audio';
+
 function playRecallWords() {
   document.getElementById('wave').classList.remove('idle');
-  return new Promise(res => setTimeout(res, RECALL_AUDIO_MS));
+  return new Promise(resolve => {
+    const fallback = setTimeout(resolve, RECALL_FALLBACK_MS);
+    const done = () => { clearTimeout(fallback); resolve(); };
+    fetch(RECALL_AUDIO_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ words: RECALL_WORDS })
+    })
+      .then(r => { if (!r.ok) throw new Error('proxy error ' + r.status); return r.blob(); })
+      .then(blob => {
+        const audio = new Audio(URL.createObjectURL(blob));
+        audio.onended = done;
+        return audio.play();
+      })
+      .catch(done);
+  });
 }
 
 // ---- Balance: fixed dot + progress ring ----
@@ -261,19 +278,31 @@ function startVor() {
   setTimeout(() => document.getElementById('vor-next').disabled = false, VOR_MS);
 }
 
-// ---- Recall marking ----
-const marks = Array(WORD_COUNT).fill(null); // in-memory only
+// ---- Recall marking: 3 spoken words + 2 decoys, shuffled ----
+const RECALL_DECOYS = ["chair", "blue"];
+let checkWords = [];
+let marks = []; // in-memory only
 
-const slotsEl = document.getElementById('slots');
-for (let i = 0; i < WORD_COUNT; i++) {
-  const row = document.createElement('div');
-  row.className = 'slot';
-  row.innerHTML = `<span>Word ${i + 1}</span>
-    <span class="toggles">
-      <button onclick="mark(${i}, true, this)">Correct</button>
-      <button onclick="mark(${i}, false, this)">Incorrect</button>
-    </span>`;
-  slotsEl.appendChild(row);
+const shuffle = a => [...a].sort(() => Math.random() - 0.5);
+
+function startRecallMarking() {
+  const real = shuffle(RECALL_WORDS).slice(0, 3);
+  checkWords = shuffle([...real, ...RECALL_DECOYS]);
+  marks = Array(checkWords.length).fill(null);
+  const slotsEl = document.getElementById('slots');
+  slotsEl.innerHTML = '';
+  checkWords.forEach((w, i) => {
+    const row = document.createElement('div');
+    row.className = 'slot';
+    row.innerHTML = `<span class="word">${w}</span>
+      <span class="toggles">
+        <button onclick="mark(${i}, true, this)">Heard</button>
+        <button onclick="mark(${i}, false, this)">Not heard</button>
+      </span>`;
+    slotsEl.appendChild(row);
+  });
+  document.getElementById('submit-btn').disabled = true;
+  show('recall-marking');
 }
 
 function mark(i, correct, btn) {
@@ -291,9 +320,6 @@ function submitRecall() {
 }
 
 function resetAll() {
-  marks.fill(null);
-  document.querySelectorAll('.slot .toggles button')
-    .forEach(b => b.classList.remove('sel-correct', 'sel-incorrect'));
   ['recall-next', 'balance-next', 'pursuit-next', 'vor-next', 'submit-btn']
     .forEach(id => document.getElementById(id).disabled = true);
   document.getElementById('wave').classList.add('idle');
