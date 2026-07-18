@@ -127,6 +127,7 @@
   .slot .toggles button.sel-incorrect { background: var(--gray); color: #fff; border-color: var(--gray); }
 
   .footer { min-height: 4rem; display: flex; align-items: center; }
+  .calib-status { font-size: 1rem; color: var(--gray); }
 </style>
 </head>
 <body>
@@ -147,7 +148,13 @@
 <div class="screen" id="recall-priming">
   <p class="instruction">Listen carefully and remember these words.</p>
   <div class="wave idle" id="wave"><span></span><span></span><span></span><span></span><span></span></div>
-  <div class="footer"><button id="recall-next" disabled onclick="startBalance()">Next</button></div>
+  <div class="footer"><button id="recall-next" disabled onclick="startCalibration()">Next</button></div>
+</div>
+
+<div class="screen" id="calibration">
+  <p class="instruction">Getting the camera ready. Sit comfortably and look at the screen.</p>
+  <div class="waiting-pulse"></div>
+  <div class="footer"><span class="calib-status" id="calib-status">Starting camera...</span></div>
 </div>
 
 <div class="screen" id="balance">
@@ -189,13 +196,24 @@
 <script>
 // ---- Durations (ms) — tune here ----
 const RECALL_FALLBACK_MS = 8000; // enable Next even if audio 'ended' never fires
+const CALIB_POLL_MS    = 300;
+const CALIB_TIMEOUT_MS = 25000; // give up waiting for a face, run the tests anyway
+const CALIB_SETTLE_MS  = 1200;  // let a few stable frames land before Balance
 const BALANCE_MS      = 20000;
 const PURSUIT_MS      = 15000;
 const VOR_MS          = 20000;
 const COMPLETE_MS     = 4000;
 
-// TODO: replace with MediaPipe/OpenCV head tracking — start/stop capture
-// per test in startBalance / startPursuit / startVor.
+// ---- Head tracking (local Flask blueprint; QNX polls /tracking/snapshot) ----
+const TRACKING_BASE = 'http://localhost:3001/tracking';
+
+// Fire-and-forget: a tracking failure must never stall the assessment.
+function trackStart() {
+  fetch(TRACKING_BASE + '/start', { method: 'POST' }).catch(() => {});
+}
+function trackStop() {
+  fetch(TRACKING_BASE + '/stop', { method: 'POST' }).catch(() => {});
+}
 
 function show(id) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
@@ -248,9 +266,44 @@ function playRecallWords() {
   });
 }
 
+// ---- Calibration: absorb camera + model warm-up (~10s) before Balance ----
+// Camera stays open from here through VOR; each test's trackStart() only
+// rebaselines the running mean, so the warm-up is paid once.
+function startCalibration() {
+  show('calibration');
+  trackStart();
+  speak("Getting the camera ready. Please sit still and look at the screen.");
+  const status = document.getElementById('calib-status');
+  const began = performance.now();
+
+  (function poll() {
+    const giveUp = performance.now() - began > CALIB_TIMEOUT_MS;
+    fetch(TRACKING_BASE + '/snapshot')
+      .then(r => r.json())
+      .then(s => {
+        if (s.error) {
+          // Tracking is dead; the assessment itself still has to run.
+          status.textContent = 'Camera unavailable — continuing without tracking';
+          setTimeout(startBalance, 1500);
+        } else if (s.face) {
+          status.textContent = 'Ready';
+          setTimeout(startBalance, CALIB_SETTLE_MS);
+        } else if (giveUp) {
+          status.textContent = 'Continuing';
+          startBalance();
+        } else {
+          status.textContent = s.running ? 'Finding your face...' : 'Starting camera...';
+          setTimeout(poll, CALIB_POLL_MS);
+        }
+      })
+      .catch(() => giveUp ? startBalance() : setTimeout(poll, CALIB_POLL_MS));
+  })();
+}
+
 // ---- Balance: fixed dot + progress ring ----
 function startBalance() {
   show('balance');
+  trackStart();
   speak("Look at the dot. Try to stay still.");
   const fill = document.querySelector('#balance-ring .fill');
   const C = 2 * Math.PI * 56;
@@ -267,6 +320,7 @@ function startBalance() {
 // ---- Smooth pursuit: horizontal sweep, then vertical sweep ----
 function startPursuit() {
   show('pursuit');
+  trackStart();
   speak("Follow the dot with your eyes. Keep your head still.");
   const dot = document.getElementById('pursuit-dot');
   const start = performance.now();
@@ -290,8 +344,12 @@ function startPursuit() {
 // ---- VOR: fixed dot with pacing pulse ----
 function startVor() {
   show('vor');
+  trackStart();
   speak("Keep your eyes on the dot. Gently turn your head side to side.");
-  setTimeout(() => document.getElementById('vor-next').disabled = false, VOR_MS);
+  setTimeout(() => {
+    trackStop();
+    document.getElementById('vor-next').disabled = false;
+  }, VOR_MS);
 }
 
 // ---- Recall marking: 3 spoken words + 2 decoys, shuffled ----
@@ -337,6 +395,7 @@ function submitRecall() {
 }
 
 function resetAll() {
+  trackStop();  // safety net if the flow reset mid-test
   ['recall-next', 'balance-next', 'pursuit-next', 'vor-next', 'submit-btn']
     .forEach(id => document.getElementById(id).disabled = true);
   document.getElementById('wave').classList.add('idle');
