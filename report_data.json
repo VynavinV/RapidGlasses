@@ -1,120 +1,107 @@
 {
-  "session_id": "RG-2026-0719-001",
-  "patient_label": "Athlete A",
-  "assessed_at": "2026-07-19T15:04:00-04:00",
-  "assessment_duration_seconds": 312,
-
   "outcome": {
     "flag": "refer",
-    "headline": "Deviation from expected — refer for medical evaluation",
-    "scat5_score": 18,
+    "headline": "Deviation from expected \u2014 refer for medical evaluation",
+    "scat5_score": "N/A",
     "scat5_max": 132,
     "gate_decision": "ambiguous",
     "stage3_triggered": true,
     "cleared_to_play": false
   },
-
   "hard_overrides": {
     "anisocoria": {
-      "triggered": false,
-      "left_pupil_mm": 4.2,
-      "right_pupil_mm": 4.0,
-      "asymmetry_mm": 0.2,
-      "threshold_mm": 1.0
+      "triggered": false
     },
     "vor_severe": {
-      "triggered": false,
-      "gaze_variance_ratio": 1.8,
-      "threshold_ratio": 2.5
+      "triggered": false
     }
   },
-
   "stage1": {
     "pupil": {
-      "left_mean_mm": 4.2,
-      "right_mean_mm": 4.0,
-      "left_variance": 0.31,
-      "right_variance": 0.28,
-      "combined_mean_mm": 4.1,
-      "status": "elevated_variance"
-    },
-    "blink": {
-      "rate_per_minute": 22,
-      "mean_duration_ms": 145,
-      "reference_rate_min": 12,
-      "reference_rate_max": 20,
-      "status": "elevated"
-    },
-    "plr": {
-      "stimulus_used": true,
-      "amplitude_percent": 38,
-      "reference_min_percent": 15,
+      "left_mean_mm": "N/A",
+      "right_mean_mm": "N/A",
+      "left_variance": "N/A",
+      "right_variance": "N/A",
+      "combined_mean_mm": 27.7,
       "status": "normal"
     },
-    "hrv": {
-      "heart_rate_bpm": 88,
-      "hrv_rmssd_ms": 24,
-      "source": "Presage (laptop)",
-      "status": "elevated_hr"
+    "blink": {
+      "rate_per_minute": "N/A",
+      "mean_duration_ms": "N/A",
+      "reference_rate_min": "N/A",
+      "reference_rate_max": "N/A",
+      "status": "N/A"
     },
-    "stage1_composite_score": 62,
-    "stage1_max_score": 100
+    "plr": {
+      "stimulus_used": false,
+      "amplitude_percent": "N/A",
+      "reference_min_percent": "N/A",
+      "status": "N/A"
+    },
+    "hrv": {
+      "heart_rate_bpm": 65,
+      "hrv_rmssd_ms": "N/A",
+      "source": "Presage (laptop)",
+      "status": "N/A"
+    }
   },
-
   "stage3": {
     "balance": {
-      "sway_magnitude_px": 18.4,
-      "sway_frequency_hz": 0.42,
+      "sway_magnitude_px": 0.009370333137067803,
+      "sway_frequency_hz": "N/A",
       "duration_seconds": 20,
-      "threshold_magnitude_px": 12.0,
-      "status": "deviation"
+      "threshold_magnitude_px": "N/A",
+      "status": "normal"
     },
     "smooth_pursuit": {
-      "horizontal_correlation": 0.71,
-      "vertical_correlation": 0.68,
-      "threshold_min": 0.75,
-      "status": "mild_deviation"
+      "horizontal_correlation": "N/A",
+      "vertical_correlation": "N/A",
+      "threshold_min": "N/A",
+      "status": "N/A"
     },
     "vor": {
-      "static_gaze_variance": 0.04,
-      "motion_gaze_variance": 0.07,
-      "variance_ratio": 1.75,
-      "threshold_ratio": 2.5,
-      "status": "borderline"
+      "static_gaze_variance": "N/A",
+      "motion_gaze_variance": "N/A",
+      "variance_ratio": "N/A",
+      "threshold_ratio": "N/A",
+      "status": "N/A"
     },
     "recall": {
-      "words_presented": ["apple", "table", "river", "silver", "garden"],
-      "words_recalled": ["apple", "river", "garden"],
-      "score": 3,
+      "words_presented": [
+        "apple",
+        "dog",
+        "green",
+        "road",
+        "seven"
+      ],
+      "words_recalled": [
+        "dog",
+        "blue",
+        "chair",
+        "road"
+      ],
+      "score": 2,
       "max_score": 5,
-      "scoring_method": "bystander_marked"
-    },
-    "stage3_composite_score": 58,
-    "stage3_max_score": 100
+      "scoring_method": "self_marked"
+    }
   },
-
   "fusion": {
-    "stage1_weight": 0.55,
-    "stage3_weight": 0.45,
-    "weighted_composite": 60.4,
-    "decision_basis": "Weighted composite exceeded ambiguous threshold; no hard override applied."
+    "decision_basis": "Rule-based fallback (Gemini unavailable: no GEMINI_API_KEY). Deviations: recall 2/5"
   },
-
   "narration": {
-    "summary": "Several objective markers during sideline screening showed patterns that differ from expected ranges. Pupil tracking showed elevated diameter variance, blink rate was above reference, and heart rate was mildly elevated. Secondary balance testing showed increased head sway during fixation. Smooth pursuit tracking was slightly below the correlation threshold. Vestibulo-ocular reflex testing was borderline but did not trigger a severe override. Word recall was 3 of 5. These findings do not constitute a diagnosis. The athlete should be referred for medical evaluation before any return-to-play decision.",
+    "summary": "Automated fallback summary. Deviations noted: recall 2/5. This is a screening result, not a diagnosis.",
     "recommendations": [
-      "Refer to a licensed medical professional for clinical evaluation.",
-      "Do not return to play based on this screening result alone.",
-      "Monitor for worsening symptoms and seek emergency care if red-flag signs appear."
+      "Refer to a licensed medical professional for evaluation.",
+      "Monitor for worsening symptoms."
     ]
   },
-
+  "session_id": "RG-20260719-015952",
+  "assessed_at": "2026-07-19T01:59:52-0400",
   "metadata": {
     "devices": {
       "glasses": "ESP32-S3 IR stream",
-      "laptop": "Presage HR/HRV",
-      "fusion_node": "Raspberry Pi (QNX)",
-      "tablet": "MacBook secondary battery"
+      "laptop": "Presage HR/HRV + webcam sway",
+      "fusion_node": "Raspberry Pi 5 (QNX)"
     },
     "report_version": "1.0.0"
   }
