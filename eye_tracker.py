@@ -13,13 +13,17 @@ polls it via /eye/snapshot and decides whether to abort to the report.
 
 Config: eye_config.json next to this file (see repo copy). Env vars with the
 same uppercase names override it, e.g. EYE_STREAM_URL, PUPIL_MIN_PX.
-Needs only: opencv, numpy, requests.
+
+Needs only: opencv (core/imgproc/imgcodecs — no GUI, no video IO backend),
+numpy, requests. The MJPEG stream is parsed over plain HTTP, so QNX opencv
+builds without highgui/ffmpeg work as-is.
 """
 import json
 import os
 import time
 
 import cv2
+import numpy as np
 import requests
 
 from main import Tracker
@@ -48,20 +52,42 @@ PUPIL_MIN_PX = float(cfg("pupil_min_px", 14))   # constricted below this
 PUPIL_MAX_PX = float(cfg("pupil_max_px", 80))   # blown above this
 
 
-def run_session(cap, sess):
-    """One connected stream session. Returns when the stream drops."""
+def mjpeg_frames(sess, url):
+    """Yield BGR frames from an MJPEG-over-HTTP stream.
+
+    Pure requests + cv2.imdecode: works on QNX opencv builds that have no
+    video IO backend (ffmpeg/gstreamer) and no GUI. JPEGs are cut out of the
+    byte stream at their SOI/EOI markers (ffd8/ffd9), which is all the ESP32
+    MJPEG framing needs. Raises requests exceptions when the stream drops.
+    """
+    resp = sess.get(url, stream=True, timeout=(3.05, 10))
+    resp.raise_for_status()
+    buf = b""
+    for chunk in resp.iter_content(chunk_size=8192):
+        buf += chunk
+        while True:
+            soi = buf.find(b"\xff\xd8")
+            eoi = buf.find(b"\xff\xd9", soi + 2)
+            if soi < 0 or eoi < 0:
+                break
+            jpg, buf = buf[soi:eoi + 2], buf[eoi + 2:]
+            frame = cv2.imdecode(np.frombuffer(jpg, np.uint8),
+                                 cv2.IMREAD_COLOR)
+            if frame is not None:
+                yield frame
+        if len(buf) > 1_000_000:   # corrupt stream guard: drop and resync
+            buf = b""
+
+
+def run_session(frames, sess):
+    """One connected stream session. Returns/raises when the stream drops."""
     tracker = Tracker()
     r1_start = None
     r1_diams = []
     round1 = {"done": False}
     send_fail_logged = False
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            print("stream dropped")
-            return
-
+    for frame in frames:
         display, m = tracker.process(frame)
         now = time.time()
 
@@ -103,16 +129,12 @@ def run_session(cap, sess):
 def main():
     sess = requests.Session()
     while True:
-        cap = cv2.VideoCapture(STREAM_URL)
-        if not cap.isOpened():
-            print(f"cannot open stream {STREAM_URL}, retrying in 2s")
-            time.sleep(2)
-            continue
-        print(f"streaming from {STREAM_URL} -> {INGEST_URL}")
         try:
-            run_session(cap, sess)
-        finally:
-            cap.release()
+            print(f"connecting to {STREAM_URL} -> {INGEST_URL}")
+            run_session(mjpeg_frames(sess, STREAM_URL), sess)
+            print("stream ended")
+        except requests.RequestException as exc:
+            print(f"stream error: {exc}")
         time.sleep(2)
 
 
