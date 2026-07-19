@@ -26,3 +26,7 @@ Thumbs.db
 
 # QNX tracker log
 eye_tracker.log
+
+# Per-patient report store (runtime artifact, reset each run)
+report_data.json
+report_data.json.lock

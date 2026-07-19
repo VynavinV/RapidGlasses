@@ -2,5 +2,6 @@ flask
 flask-cors
 requests
 python-dotenv
+filelock
 opencv-python
 mediapipe
