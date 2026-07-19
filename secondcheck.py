@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 
+import eye
+from gemini_report import write_abnormal, write_full
 from tracking import tracking_bp
 
 load_dotenv()
@@ -18,6 +20,31 @@ ELEVENLABS_URL = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
 app = Flask(__name__)
 CORS(app)
 app.register_blueprint(tracking_bp)
+app.register_blueprint(eye.eye_bp)
+
+
+@app.route("/api/finalize", methods=["POST"])
+def finalize():
+    """End of assessment. The browser sends what it collected (recall answers,
+    per-test sway snapshots, round-1 verdict); we add the eye-tracker summary
+    and vitals, then write report_data.json — directly for the abnormal
+    hard-stop, via Gemini otherwise. The browser redirects to the report
+    (report.py, port 8080) once this returns."""
+    payload = request.get_json(silent=True) or {}
+    eye_summary = eye.summary()
+    if payload.get("round1"):      # browser-confirmed verdict wins over stale
+        eye_summary["round1"] = payload["round1"]
+    try:
+        vitals = requests.get("http://localhost:3002/vitals", timeout=1).json()
+    except Exception:
+        vitals = None
+
+    if payload.get("abnormal"):
+        write_abnormal(payload.get("reason", "pupil size out of range"),
+                       eye_summary)
+    else:
+        write_full(payload, eye_summary, vitals)
+    return jsonify(ok=True)
 
 
 def _tts(phrase):

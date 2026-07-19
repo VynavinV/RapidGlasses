@@ -42,6 +42,7 @@ VITALS_FRAME_URL = os.environ.get("VITALS_FRAME_URL", "http://localhost:3002/fra
 _lock = threading.Lock()
 _thread = None
 _stop = threading.Event()
+_rebaseline = threading.Event()   # /tracking/start on a live loop -> zero sums
 _jpeg = None              # latest annotated frame as JPEG, for /tracking/video
 
 # Everything below _lock is read by request threads and written by the loop.
@@ -51,6 +52,9 @@ _state = {
     "mean_x": None,
     "mean_y": None,
     "deviation": None,
+    "mean_deviation": None,   # mean |offset from baseline| since start
+    "max_deviation": None,
+    "samples": 0,
     "timestamp": None,    # when x/y were measured, not when polled
     "fps": 0.0,
     "face": False,
@@ -61,6 +65,7 @@ _state = {
 
 def _reset_locked():
     _state.update(x=None, y=None, mean_x=None, mean_y=None, deviation=None,
+                  mean_deviation=None, max_deviation=None, samples=0,
                   timestamp=None, fps=0.0, face=False, error=None)
 
 
@@ -144,6 +149,7 @@ def _loop():
     cap = landmarker = None
     n = 0                 # frames folded into the mean since start
     sum_x = sum_y = 0.0
+    dev_sum = dev_max = 0.0
     stamps = deque(maxlen=FPS_WINDOW)
     sess = requests.Session()
     vitals_backoff = [0.0]
@@ -174,6 +180,11 @@ def _loop():
         misses = 0
         hist = deque(maxlen=DEV_HISTORY)
         while not _stop.is_set():
+            if _rebaseline.is_set():
+                _rebaseline.clear()
+                n = 0
+                sum_x = sum_y = dev_sum = dev_max = 0.0
+                hist.clear()
             ok, frame = cap.read()
             if not ok:
                 # Don't spin hot on a camera that stops delivering.
@@ -217,11 +228,14 @@ def _loop():
             sum_y += y
             mean_x, mean_y = sum_x / n, sum_y / n
             deviation = math.hypot(x - mean_x, y - mean_y)
+            dev_sum += deviation
+            dev_max = max(dev_max, deviation)
 
             with _lock:
                 _state.update(x=x, y=y, mean_x=mean_x, mean_y=mean_y,
-                              deviation=deviation, timestamp=stamps[-1],
-                              fps=fps, face=True)
+                              deviation=deviation, mean_deviation=dev_sum / n,
+                              max_deviation=dev_max, samples=n,
+                              timestamp=stamps[-1], fps=fps, face=True)
 
             hist.append(deviation)
             _publish(cv2, np, frame, (x, y), (mean_x, mean_y), deviation,
@@ -258,6 +272,7 @@ def start():
         _state["running"] = True
 
     if already:
+        _rebaseline.set()     # tell the live loop to zero its local sums too
         return jsonify(status="running", restarted=False)
 
     _stop.clear()

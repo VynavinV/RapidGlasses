@@ -183,39 +183,32 @@ def build_panel(h, pw, active, diam, pct, dev, dx, dy, hist):
     return panel
 
 
-def main():
-    cap = cv2.VideoCapture(STREAM_URL)
-    if not cap.isOpened():
-        print(f"Failed to open stream: {STREAM_URL}")
-        return
-    print("Streaming... press ESC or 'q' to quit.")
+class Tracker:
+    """Stateful per-frame pipeline: detection + Kalman + overlays.
 
-    WIN = "RapidGlasses Eye Tracker"
-    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WIN, 1280, 720)
+    process(frame) -> (display, metrics). display is the annotated eye view
+    with the HUD panel attached; metrics is a plain dict, JSON-safe. Used by
+    main() for the local window and by eye_tracker.py headless on QNX.
+    """
 
-    kf = make_kalman()
-    inited = False
-    miss = 0
-    trail = deque(maxlen=TRAIL_LEN)
-    hist = deque(maxlen=DILATION_HISTORY)
-    baseline = None
-    shape = None            # smoothed (MA, ma, sin2a, cos2a)
+    def __init__(self):
+        self.kf = make_kalman()
+        self.inited = False
+        self.miss = 0
+        self.trail = deque(maxlen=TRAIL_LEN)
+        self.hist = deque(maxlen=DILATION_HISTORY)
+        self.baseline = None
+        self.shape = None       # smoothed (MA, ma, sin2a, cos2a)
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Failed to read frame from stream.")
-            break
-
+    def process(self, frame):
         h, w = frame.shape[:2]
         fcx, fcy = w // 2, h // 2
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        prior = (float(kf.statePost[0, 0]), float(kf.statePost[1, 0])) \
-            if inited else None
+        prior = (float(self.kf.statePost[0, 0]),
+                 float(self.kf.statePost[1, 0])) if self.inited else None
         ell, glint = detect_pupil(gray, prior)
-        pred = kf.predict() if inited else None
+        pred = self.kf.predict() if self.inited else None
 
         diam = pct = dev = dx = dy = 0.0
         active = False
@@ -228,38 +221,38 @@ def main():
             # EMA-smooth shape; angle via sin/cos(2a) to avoid 180-deg wrap jumps
             a2 = np.radians(2 * ang)
             meas_shape = (MA, ma, np.sin(a2), np.cos(a2))
-            if shape is None:
-                shape = meas_shape
+            if self.shape is None:
+                self.shape = meas_shape
             else:
-                shape = tuple(o + (n - o) * SHAPE_EMA
-                              for o, n in zip(shape, meas_shape))
+                self.shape = tuple(o + (n - o) * SHAPE_EMA
+                                   for o, n in zip(self.shape, meas_shape))
             meas = np.array([[np.float32(ex)], [np.float32(ey)]])
-            if not inited:
-                kf.statePost = np.array([[ex], [ey], [0], [0]], np.float32)
-                inited = True
-                miss = 0
+            if not self.inited:
+                self.kf.statePost = np.array([[ex], [ey], [0], [0]], np.float32)
+                self.inited = True
+                self.miss = 0
             else:
                 far = np.hypot(ex - pred[0, 0], ey - pred[1, 0])
                 if far < max(diam * 1.5, 45):
-                    kf.correct(meas)              # normal update
-                    miss = 0
+                    self.kf.correct(meas)         # normal update
+                    self.miss = 0
                 else:
-                    miss += 1                     # detection disagrees w/ lock
-                    if miss >= 4:                 # stuck -> re-acquire here
-                        kf.statePost = np.array(
+                    self.miss += 1                # detection disagrees w/ lock
+                    if self.miss >= 4:            # stuck -> re-acquire here
+                        self.kf.statePost = np.array(
                             [[ex], [ey], [0], [0]], np.float32)
-                        trail.clear()
-                        miss = 0
+                        self.trail.clear()
+                        self.miss = 0
 
-        if inited:
+        if self.inited:
             active = True
-            cx = float(kf.statePost[0, 0])
-            cy = float(kf.statePost[1, 0])
+            cx = float(self.kf.statePost[0, 0])
+            cy = float(self.kf.statePost[1, 0])
             icx, icy = int(cx), int(cy)
-            trail.append((icx, icy))
+            self.trail.append((icx, icy))
 
-            if shape is not None:
-                sMA, sma, s2, c2 = shape
+            if self.shape is not None:
+                sMA, sma, s2, c2 = self.shape
                 sang = np.degrees(np.arctan2(s2, c2)) / 2.0
                 diam = (sMA + sma) / 2.0
                 cv2.ellipse(frame, ((cx, cy), (sMA, sma), sang), GREEN, 2)
@@ -272,22 +265,49 @@ def main():
             cv2.drawMarker(frame, (fcx, fcy), GRAY, cv2.MARKER_CROSS, 16, 1)
             cv2.arrowedLine(frame, (fcx, fcy), (icx, icy), AMBER, 1,
                             tipLength=0.18)
-            for i in range(1, len(trail)):
-                cv2.line(frame, trail[i - 1], trail[i], (255, 160, 0), 1)
+            for i in range(1, len(self.trail)):
+                cv2.line(frame, self.trail[i - 1], self.trail[i],
+                         (255, 160, 0), 1)
 
-            if shape is not None:
-                hist.append(diam)
-                baseline = diam if baseline is None else \
-                    0.985 * baseline + 0.015 * diam
-                pct = (diam - baseline) / baseline * 100.0
+            if self.shape is not None:
+                self.hist.append(diam)
+                self.baseline = diam if self.baseline is None else \
+                    0.985 * self.baseline + 0.015 * diam
+                pct = (diam - self.baseline) / self.baseline * 100.0
 
         # scale the eye view up to a crisp fixed height, build HUD to match
         disp_h = 640
         scale = disp_h / h
         big = cv2.resize(frame, (int(w * scale), disp_h),
                          interpolation=cv2.INTER_NEAREST)
-        panel = build_panel(disp_h, 320, active, diam, pct, dev, dx, dy, hist)
-        cv2.imshow(WIN, np.hstack([big, panel]))
+        panel = build_panel(disp_h, 320, active, diam, pct, dev, dx, dy,
+                            self.hist)
+        display = np.hstack([big, panel])
+        metrics = {"active": active, "diam": round(diam, 2),
+                   "dilation_pct": round(pct, 2), "dev": round(dev, 2),
+                   "dx": round(dx, 1), "dy": round(dy, 1)}
+        return display, metrics
+
+
+def main():
+    cap = cv2.VideoCapture(STREAM_URL)
+    if not cap.isOpened():
+        print(f"Failed to open stream: {STREAM_URL}")
+        return
+    print("Streaming... press ESC or 'q' to quit.")
+
+    WIN = "RapidGlasses Eye Tracker"
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WIN, 1280, 720)
+
+    tracker = Tracker()
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to read frame from stream.")
+            break
+        display, _ = tracker.process(frame)
+        cv2.imshow(WIN, display)
         key = cv2.waitKey(1) & 0xFF
         if key == 27 or key == ord("q"):
             break

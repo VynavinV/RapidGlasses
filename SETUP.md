@@ -213,3 +213,76 @@ git commit -m "stop tracking venv"
 
 The folder stays on disk; git just stops watching it. Everyone else should
 delete their local `venv/` after pulling and use `.venv/` per step 2.
+
+## Eye tracker (QNX Raspberry Pi 5)
+
+The Pi runs the ML end-to-end and pushes results to the laptop; the laptop
+never touches the ESP32 stream.
+
+```
+ESP32 IR cam --> eye_tracker.py (Pi/QNX) --POST /eye/ingest--> secondcheck.py :3001
+                                                                     |
+                              index.html <-- /eye/video (MJPEG) + /eye/snapshot
+```
+
+On the Pi (needs python3 with opencv, numpy, requests — the repo `venv/` is
+macOS-only, don't use it there):
+
+1. `git clone` the repo (already done if you're reading this on the Pi).
+2. Edit **`eye_config.json`** — this is the only file you should need to touch:
+
+```json
+{
+  "eye_stream_url": "http://<esp32-ip>:81/stream",
+  "eye_server_url": "http://<laptop-ip>:3001",
+  "round1_seconds": 8.0,
+  "pupil_min_px": 14,
+  "pupil_max_px": 80
+}
+```
+
+3. Run `./start_tracker.sh` — it keeps `eye_tracker.py` alive forever
+   (restarts 3 s after any crash) and logs to `eye_tracker.log`. Watch it
+   with `tail -f eye_tracker.log`.
+
+Env vars with the same names uppercased (`EYE_STREAM_URL`, `PUPIL_MIN_PX`,
+...) override the json for one-off runs. Headless — no windows, no GUI deps;
+it reconnects to both the stream and the server on its own.
+
+### Run at boot (QNX)
+
+QNX runs `/etc/rc.d/rc.local` at startup if it exists and is executable.
+As root (`su`), with your actual repo path (`pwd` inside the repo to check —
+note QNX images often put home under `/data/home/...`):
+
+```sh
+mkdir -p /etc/rc.d
+echo '#!/bin/sh' > /etc/rc.d/rc.local
+echo '/data/home/qnxuser/RapidGlasses/start_tracker.sh &' >> /etc/rc.d/rc.local
+chmod +x /etc/rc.d/rc.local
+```
+
+Reboot and check `eye_tracker.log` to confirm. Network coming up late is
+fine — the tracker retries the ESP32 and the laptop forever.
+
+## Assessment flow
+
+1. **Round 1** — the waiting screen shows the annotated eye stream full size.
+   The Pi measures the median pupil diameter for ~8 s. Abnormal (blown or
+   constricted) → the server writes an immediate "refer" report (everything
+   uncollected is N/A) and the browser jumps to the report. Normal → the
+   assessment starts, and the eye view moves to the bottom-right pip above
+   the webcam feed.
+2. **Tests** — balance / pursuit / VOR each capture the head-sway mean/max
+   from `/tracking/snapshot` when they finish.
+3. **Finalize** — after recall, the browser POSTs everything to
+   `/api/finalize`. The server adds pupil stats, sampled eye-tracker frames,
+   and vitals, then calls Gemini to write `report_data.json`
+   (`GEMINI_API_KEY` in `.env`; without it a rule-based fallback report is
+   written instead). The browser then redirects to the report.
+
+Run the report server alongside `secondcheck.py`:
+
+```bash
+python report.py        # serves the report at http://localhost:8080/report
+```

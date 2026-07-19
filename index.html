@@ -129,15 +129,30 @@
   .footer { min-height: 4rem; display: flex; align-items: center; }
   .calib-status { font-size: 1rem; color: var(--gray); }
 
-  /* Camera monitor (FaceTime-style, bottom right) */
-  #cam-overlay {
+  /* Bottom-right monitor stack: eye tracker view above the webcam feed */
+  #pip-stack {
     position: fixed;
     right: 1.2rem; bottom: 1.2rem;
+    display: flex; flex-direction: column; gap: 0.6rem;
+    align-items: flex-end;
+    z-index: 50;
+  }
+  #eye-pip, #cam-overlay {
     width: 320px; height: auto;
     border-radius: 0.8rem;
     background: #111;
     box-shadow: 0 6px 24px rgba(0,0,0,0.25);
-    z-index: 50;
+    display: block;
+  }
+  #eye-pip[hidden] { display: none; }
+
+  /* Big eye view on the round-1 waiting screen */
+  #eye-big {
+    width: min(72vw, 900px);
+    max-height: 55vh;
+    object-fit: contain;
+    border-radius: 0.8rem;
+    background: #111;
   }
 
   /* Live heart rate (top right) */
@@ -170,13 +185,16 @@
 
 <div id="hr-badge"><span class="heart">&#10084;</span><span class="bpm" id="hr-value">--</span><span>bpm</span></div>
 <div id="hr-status"></div>
-<img id="cam-overlay" alt="camera">
+<div id="pip-stack">
+  <img id="eye-pip" alt="eye tracker" hidden>
+  <img id="cam-overlay" alt="camera">
+</div>
 
 <div class="screen active" id="waiting">
-  <div class="waiting-pulse"></div>
-  <h1>Waiting for Stage 1 signal</h1>
-  <!-- TODO: replace click with real Stage 1 signal (WebSocket/push) -->
-  <button class="secondary" onclick="show('intro')">Simulate signal</button>
+  <h1>Round 1 — Pupil check</h1>
+  <img id="eye-big" alt="eye tracker stream">
+  <p class="instruction" id="waiting-status">Waiting for the eye tracker...</p>
+  <button class="secondary" onclick="show('intro')">Skip (no tracker)</button>
 </div>
 
 <div class="screen" id="intro">
@@ -242,11 +260,16 @@ const CALIB_SETTLE_MS  = 1200;  // let a few stable frames land before Balance
 const BALANCE_MS      = 20000;
 const PURSUIT_MS      = 15000;
 const VOR_MS          = 20000;
-const COMPLETE_MS     = 4000;
 
-// ---- Head tracking (local Flask blueprint; QNX polls /tracking/snapshot) ----
+// ---- Head tracking (local Flask blueprint) ----
 const TRACKING_BASE = 'http://localhost:3001/tracking';
 const VITALS_URL = 'http://localhost:3002/vitals';
+
+// ---- Eye tracker (QNX Pi pushes to the Flask eye blueprint; we read it) ----
+const EYE_BASE = 'http://localhost:3001/eye';
+const FINALIZE_URL = 'http://localhost:3001/api/finalize';
+const REPORT_URL = 'http://localhost:8080/report';
+const EYE_POLL_MS = 500;
 
 // Fire-and-forget: a tracking failure must never stall the assessment.
 function trackStart() {
@@ -267,6 +290,16 @@ function connectCam() {
 camImg.onerror = () => setTimeout(connectCam, 2000);
 trackStart();
 connectCam();
+
+// Retry the big eye stream while the waiting screen is up (server may not
+// be relaying frames yet when the page loads).
+document.getElementById('eye-big').onerror = () => setTimeout(() => {
+  const w = document.getElementById('waiting');
+  if (w.classList.contains('active'))
+    document.getElementById('eye-big').src = EYE_BASE + '/video?' + Date.now();
+}, 2000);
+// Kick off round 1 (the waiting screen is the initial screen).
+window.addEventListener('load', () => show('waiting'));
 
 const hrBadge = document.getElementById('hr-badge');
 const hrValue = document.getElementById('hr-value');
@@ -296,6 +329,88 @@ setInterval(() => {
 function show(id) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.getElementById(id).classList.add('active');
+  // Eye stream: big on the round-1 waiting screen, small pip everywhere else
+  // (bottom right, above the webcam feed). Two <img>s, one MJPEG src each.
+  const big = document.getElementById('eye-big');
+  const pip = document.getElementById('eye-pip');
+  if (id === 'waiting') {
+    pip.hidden = true;
+    pip.removeAttribute('src');
+    big.src = EYE_BASE + '/video?' + Date.now();
+    pollRound1();
+  } else {
+    big.removeAttribute('src');
+    pip.hidden = false;
+    if (!pip.src) pip.src = EYE_BASE + '/video?' + Date.now();
+  }
+}
+
+// ---- Round 1: pupil check on the QNX eye tracker ----
+// The Pi computes the verdict (median pupil px over ~8s vs normal range) and
+// ships it in every metrics packet; we just poll /eye/snapshot and branch:
+// abnormal -> finalize an N/A report and jump straight to it; normal -> intro.
+let round1Result = null;
+let round1Timer = null;
+
+function pollRound1() {
+  clearTimeout(round1Timer);
+  if (!document.getElementById('waiting').classList.contains('active')) return;
+  const status = document.getElementById('waiting-status');
+  fetch(EYE_BASE + '/snapshot')
+    .then(r => r.json())
+    .then(s => {
+      if (!s.connected) {
+        status.textContent = 'Waiting for the eye tracker to connect...';
+      } else if (!s.round1 || !s.round1.done) {
+        status.textContent = s.active
+          ? `Checking pupils... ${s.diam.toFixed(1)} px`
+          : 'Finding pupil...';
+      } else {
+        round1Result = s.round1;
+        if (s.round1.abnormal) {
+          status.textContent =
+            `Abnormal pupil size (${s.round1.median_px} px) — preparing report...`;
+          return abnormalExit(s.round1);
+        }
+        status.textContent = 'Pupils normal — starting assessment';
+        setTimeout(() => show('intro'), 1200);
+        return;
+      }
+      round1Timer = setTimeout(pollRound1, EYE_POLL_MS);
+    })
+    .catch(() => {
+      status.textContent = 'Eye tracker server offline...';
+      round1Timer = setTimeout(pollRound1, EYE_POLL_MS * 2);
+    });
+}
+
+function abnormalExit(r1) {
+  fetch(FINALIZE_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      abnormal: true,
+      reason: `median pupil ${r1.median_px}px outside ${r1.min_px}-${r1.max_px}px`,
+      round1: r1
+    })
+  })
+    .catch(() => {})
+    .finally(() => { location.href = REPORT_URL; });
+}
+
+// ---- Sway capture: read the tracking stats at the end of each test ----
+const sway = {};
+function captureSway(test) {
+  fetch(TRACKING_BASE + '/snapshot')
+    .then(r => r.json())
+    .then(s => {
+      sway[test] = {
+        mean_deviation: s.mean_deviation,
+        max_deviation: s.max_deviation,
+        samples: s.samples
+      };
+    })
+    .catch(() => {});
 }
 
 // ---- Recall priming ----
@@ -391,7 +506,10 @@ function startBalance() {
     const t = Math.min((now - start) / BALANCE_MS, 1);
     fill.style.strokeDashoffset = C * (1 - t);
     if (t < 1) requestAnimationFrame(tick);
-    else document.getElementById('balance-next').disabled = false;
+    else {
+      captureSway('balance');
+      document.getElementById('balance-next').disabled = false;
+    }
   })(start);
 }
 
@@ -415,7 +533,10 @@ function startPursuit() {
     dot.style.left = x + '%';
     dot.style.top = y + '%';
     if (t < 1) requestAnimationFrame(tick);
-    else document.getElementById('pursuit-next').disabled = false;
+    else {
+      captureSway('pursuit');
+      document.getElementById('pursuit-next').disabled = false;
+    }
   })(start);
 }
 
@@ -426,6 +547,7 @@ function startVor() {
   speak("Keep your eyes on the dot. Gently turn your head side to side.");
   // Camera stays on after VOR — Presage keeps measuring heart rate.
   setTimeout(() => {
+    captureSway('vor');
     document.getElementById('vor-next').disabled = false;
   }, VOR_MS);
 }
@@ -468,16 +590,27 @@ function mark(i, correct, btn) {
 
 function submitRecall() {
   show('complete');
-  // TODO: send results to backend (out of scope)
-  setTimeout(resetAll, COMPLETE_MS);
-}
-
-function resetAll() {
-  trackStart();  // rebaseline for the next run; camera never stops
-  ['recall-next', 'balance-next', 'pursuit-next', 'vor-next', 'submit-btn']
-    .forEach(id => document.getElementById(id).disabled = true);
-  document.getElementById('wave').classList.add('idle');
-  show('waiting');
+  // score: every shown word judged correctly (real->heard, decoy->not heard)
+  const correct = checkWords.reduce((a, w, i) =>
+    a + ((RECALL_WORDS.includes(w)) === marks[i] ? 1 : 0), 0);
+  fetch(FINALIZE_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      abnormal: false,
+      round1: round1Result,
+      sway,
+      recall: {
+        words_presented: RECALL_WORDS,
+        words_shown: checkWords,
+        marked_heard: checkWords.filter((w, i) => marks[i]),
+        score: correct,
+        max_score: checkWords.length
+      }
+    })
+  })
+    .catch(() => {})   // report falls back server-side; still show it
+    .finally(() => { location.href = REPORT_URL; });
 }
 </script>
 </body>
