@@ -10,7 +10,7 @@ from flask_cors import CORS
 load_dotenv()   # before local imports — eye/gemini_report read env at import
 
 import eye
-from gemini_report import write_abnormal, write_full
+import report_store
 from tracking import tracking_bp
 
 VOICE_ID = "21m00Tcm4TlvDq8ikWAM"  # Rachel — swap as needed
@@ -25,25 +25,33 @@ app.register_blueprint(eye.eye_bp)
 
 @app.route("/api/finalize", methods=["POST"])
 def finalize():
-    """End of assessment. The browser sends what it collected (recall answers,
-    per-test sway snapshots, round-1 verdict); we add the eye-tracker summary
-    and vitals, then write report_data.json — directly for the abnormal
-    hard-stop, via Gemini otherwise. The browser redirects to the report
-    (report.py, port 8080) once this returns."""
+    """End of assessment. The browser posts its own stages (sway, recall)
+    straight to report.py's /report/data/<stage>; this endpoint contributes
+    the server-side stages — the eye-tracker summary (stage1) and vitals —
+    into the same store. The abnormal hard-stop still writes a complete
+    refer report immediately."""
     payload = request.get_json(silent=True) or {}
     eye_summary = eye.summary()
     if payload.get("round1"):      # browser-confirmed verdict wins over stale
         eye_summary["round1"] = payload["round1"]
-    try:
-        vitals = requests.get("http://localhost:3002/vitals", timeout=1).json()
-    except Exception:
-        vitals = None
 
     if payload.get("abnormal"):
-        write_abnormal(payload.get("reason", "pupil size out of range"),
-                       eye_summary)
-    else:
-        write_full(payload, eye_summary, vitals)
+        report_store.write_abnormal(
+            payload.get("reason", "pupil size out of range"), eye_summary)
+        return jsonify(ok=True)
+
+    try:
+        report_store.merge_stage("stage1", {
+            "round1": eye_summary.get("round1"),
+            "pupil_px": eye_summary.get("pupil_px"),
+        })
+    except ValueError as exc:
+        print(f"stage1 not merged: {exc}")
+    try:
+        vitals = requests.get("http://localhost:3002/vitals", timeout=1).json()
+        report_store.merge_stage("vitals", vitals)
+    except Exception as exc:       # vitals stage is optional
+        print(f"vitals not merged: {exc}")
     return jsonify(ok=True)
 
 

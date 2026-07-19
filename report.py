@@ -1,19 +1,25 @@
 """Concussion screening report server.
 
-Serves a read-only HTML report at a fixed URL. Assessment data is read from
-report_data.json (written by the fusion node / hardware pipeline).
+Serves the HTML report at a fixed URL and ingests per-stage results into
+report_data.json via report_store (file-locked; secondcheck.py writes the
+server-side stages through the same store). GET /report reads the file
+fresh on every request — no caching.
 """
 
 from __future__ import annotations
 
-import json
 from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, abort, render_template, url_for
+from dotenv import load_dotenv
+from flask import Flask, jsonify, render_template, request, url_for
+from flask_cors import CORS
+
+load_dotenv()   # GEMINI_API_KEY — finalize may run in this process
+
+import report_store
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_FILE = BASE_DIR / "report_data.json"
 
 app = Flask(
     __name__,
@@ -21,28 +27,16 @@ app = Flask(
     static_folder=str(BASE_DIR),
     static_url_path="",
 )
+CORS(app)
 
-
-def load_report_data() -> dict:
-    if not DATA_FILE.exists():
-        abort(
-            503,
-            description=(
-                "Report data is not available yet. "
-                "The assessment pipeline has not written report_data.json."
-            ),
-        )
-
-    try:
-        with DATA_FILE.open(encoding="utf-8") as handle:
-            data = json.load(handle)
-    except json.JSONDecodeError as exc:
-        abort(500, description=f"Report data file is invalid JSON: {exc}")
-
-    if not isinstance(data, dict):
-        abort(500, description="Report data must be a JSON object.")
-
-    return data
+# Shown while stages are still arriving or Gemini is writing the narration;
+# refreshes itself until the finalized report exists.
+PENDING_HTML = """<!doctype html>
+<html><head><meta http-equiv="refresh" content="2">
+<title>RapidGlasses</title></head>
+<body style="font-family:sans-serif;background:#0b1020;color:#dbe2ff;
+display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+<p>Generating report&hellip;</p></body></html>"""
 
 
 def format_timestamp(raw: str | None) -> str:
@@ -71,7 +65,9 @@ def status_class(status: str | None) -> str:
 @app.route("/")
 @app.route("/report")
 def report_page():
-    data = load_report_data()
+    data = report_store.read()
+    if "outcome" not in data:   # stages still arriving / narration running
+        return PENDING_HTML
     outcome = data.get("outcome", {})
     flag = outcome.get("flag", "no_deviation")
 
@@ -95,8 +91,28 @@ def report_page():
 
 @app.route("/api/report")
 def report_json():
-    return load_report_data()
+    return report_store.read()
+
+
+@app.route("/report/data/<stage>", methods=["POST"])
+def ingest_stage(stage):
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return jsonify(error="body must be a JSON object"), 400
+    try:
+        complete = report_store.merge_stage(stage, payload)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    return jsonify(ok=True, complete=complete)
+
+
+@app.route("/report/reset", methods=["POST"])
+def reset():
+    report_store.reset()
+    return jsonify(ok=True)
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=True)
+    # threaded: the request that completes the stage set blocks on Gemini;
+    # the pending page must still be servable meanwhile.
+    app.run(host="0.0.0.0", port=8080, debug=True, threaded=True)
