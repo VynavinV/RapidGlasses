@@ -1,62 +1,121 @@
-"""Eye-tracker bridge blueprint.
+"""Laptop-side eye bridge.
 
-The QNX Pi (eye_tracker.py) POSTs annotated JPEG frames with a JSON metrics
-header to /eye/ingest. This module just stores the latest of each and keeps a
-small history for the final report:
-  - /eye/video     MJPEG relay for the webapp (<img> src)
-  - /eye/snapshot  latest metrics + connected flag (webapp polls round 1 here)
-  - summary()      pupil stats + a few sampled frames, for gemini_report.py
+The QNX Pi runs eye_tracker.py as a server and announces itself with a UDP
+beacon on port 8131. This module listens for that beacon (set EYE_TRACKER_URL
+in .env to pin an address instead, e.g. if broadcast is blocked), pulls the
+Pi's annotated MJPEG + metrics in background threads, and re-serves them to
+the webapp on the same routes as always:
+
+    /eye/video      MJPEG relay for the <img> tags
+    /eye/snapshot   latest metrics (browser polls round 1 here)
+    summary()       proxies the Pi's /eye/summary for the report builder
+
+The browser never talks to the Pi directly; only this Flask app does.
 """
-import base64
 import json
+import os
+import socket
 import threading
 import time
-from collections import deque
 
-from flask import Blueprint, Response, jsonify, request
+import requests
+from flask import Blueprint, Response, jsonify
 
 eye_bp = Blueprint("eye", __name__)
 
-STALE_AFTER = 3.0        # seconds without an ingest -> "not connected"
-SAMPLE_GAP = 5.0         # keep one frame every N seconds for the report
-MAX_SAMPLES = 8
-MAX_DIAMS = 4000         # ~3 min of history at 20fps
+BEACON_PORT = 8131
+DEFAULT_TRACKER_PORT = 8130
+STALE_AFTER = 3.0
 
 _lock = threading.Lock()
-_jpeg = None             # latest annotated frame
+_tracker_url = os.environ.get("EYE_TRACKER_URL") or None
+_jpeg = None
 _metrics = {}
-_recv_at = 0.0
-_samples = deque(maxlen=MAX_SAMPLES)   # (ts, jpeg)
-_diams = deque(maxlen=MAX_DIAMS)
+_metrics_ts = 0.0
+_started = False
 
 
-@eye_bp.route("/eye/ingest", methods=["POST"])
-def ingest():
-    global _jpeg, _metrics, _recv_at
-    jpg = request.get_data()
-    try:
-        m = json.loads(request.headers.get("X-Metrics", "{}"))
-    except json.JSONDecodeError:
-        m = {}
-    now = time.time()
+def _get_url():
     with _lock:
-        _jpeg = jpg
-        _metrics = m
-        _recv_at = now
-        if m.get("active") and m.get("diam"):
-            _diams.append(m["diam"])
-        if not _samples or now - _samples[-1][0] >= SAMPLE_GAP:
-            _samples.append((now, jpg))
-    return "", 204
+        return _tracker_url
+
+
+def _discover_loop():
+    """Learn the Pi's address from its UDP beacon. Skipped entirely when
+    EYE_TRACKER_URL is pinned in the environment."""
+    global _tracker_url
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("", BEACON_PORT))
+    while True:
+        data, addr = s.recvfrom(1024)
+        try:
+            msg = json.loads(data)
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if msg.get("name") != "rapidglasses-eye":
+            continue
+        url = f"http://{addr[0]}:{msg.get('port', DEFAULT_TRACKER_PORT)}"
+        with _lock:
+            if url != _tracker_url:
+                print(f"eye tracker found: {url}")
+            _tracker_url = url
+
+
+def _video_loop():
+    """Hold one MJPEG connection to the Pi and keep the latest frame."""
+    global _jpeg
+    while True:
+        url = _get_url()
+        if not url:
+            time.sleep(1)
+            continue
+        try:
+            resp = requests.get(url + "/eye/video", stream=True,
+                                timeout=(3.05, 10))
+            buf = b""
+            for chunk in resp.iter_content(chunk_size=8192):
+                buf += chunk
+                while True:
+                    soi = buf.find(b"\xff\xd8")
+                    eoi = buf.find(b"\xff\xd9", soi + 2)
+                    if soi < 0 or eoi < 0:
+                        break
+                    jpg, buf = buf[soi:eoi + 2], buf[eoi + 2:]
+                    with _lock:
+                        _jpeg = jpg
+                if len(buf) > 1_000_000:
+                    buf = b""
+        except requests.RequestException:
+            pass
+        time.sleep(2)
+
+
+def _metrics_loop():
+    """Poll the Pi's snapshot a few times a second."""
+    global _metrics, _metrics_ts
+    while True:
+        url = _get_url()
+        if url:
+            try:
+                m = requests.get(url + "/eye/snapshot", timeout=1).json()
+                with _lock:
+                    _metrics = m
+                    _metrics_ts = time.time()
+            except (requests.RequestException, ValueError):
+                pass
+        time.sleep(0.25)
 
 
 @eye_bp.route("/eye/snapshot")
 def snapshot():
     with _lock:
         m = dict(_metrics)
-        age = time.time() - _recv_at if _recv_at else None
-    m["connected"] = age is not None and age < STALE_AFTER
-    m["age"] = round(age, 2) if age is not None else None
+        url = _tracker_url
+        fresh = _metrics_ts and time.time() - _metrics_ts < STALE_AFTER
+    if not fresh:
+        m = {"connected": False}       # Pi unreachable (or not found yet)
+    m["tracker"] = url                 # Pi's own `connected` = ESP32 fresh
     return jsonify(m)
 
 
@@ -76,22 +135,25 @@ def video():
 
 
 def summary():
-    """Everything the report builder needs: pupil stats, round-1 verdict,
-    and up to 4 base64 sample frames (they carry the trail/trend overlays)."""
-    with _lock:
-        diams = list(_diams)
-        samples = list(_samples)
-        m = dict(_metrics)
-    out = {"round1": m.get("round1"), "last_metrics": m}
-    if diams:
-        s = sorted(diams)
-        out["pupil_px"] = {
-            "mean": round(sum(diams) / len(diams), 1),
-            "median": round(s[len(s) // 2], 1),
-            "min": round(s[0], 1),
-            "max": round(s[-1], 1),
-            "samples": len(diams),
-        }
-    out["images_b64"] = [base64.b64encode(j).decode()
-                         for _, j in samples[-4:]]
-    return out
+    """Report-builder data, fetched straight from the Pi."""
+    url = _get_url()
+    if not url:
+        return {}
+    try:
+        return requests.get(url + "/eye/summary", timeout=10).json()
+    except (requests.RequestException, ValueError):
+        return {}
+
+
+def _start():
+    global _started
+    if _started:
+        return
+    _started = True
+    if not os.environ.get("EYE_TRACKER_URL"):
+        threading.Thread(target=_discover_loop, daemon=True).start()
+    threading.Thread(target=_video_loop, daemon=True).start()
+    threading.Thread(target=_metrics_loop, daemon=True).start()
+
+
+_start()

@@ -216,14 +216,23 @@ delete their local `venv/` after pulling and use `.venv/` per step 2.
 
 ## Eye tracker (QNX Raspberry Pi 5)
 
-The Pi runs the ML end-to-end and pushes results to the laptop; the laptop
-never touches the ESP32 stream.
+The Pi runs the ML end-to-end and serves the results; the laptop finds the
+Pi on its own and pulls from it. Only the ESP32 address is ever configured.
 
 ```
-ESP32 IR cam --> eye_tracker.py (Pi/QNX) --POST /eye/ingest--> secondcheck.py :3001
-                                                                     |
-                              index.html <-- /eye/video (MJPEG) + /eye/snapshot
+ESP32 IR cam --> eye_tracker.py (Pi/QNX, serves :8130)
+                       /eye/video  /eye/snapshot  /eye/summary
+                       + UDP beacon on :8131 ("here I am")
+                              |  laptop discovers + pulls
+                              v
+                 secondcheck.py :3001 (eye.py relay)
+                              |
+       index.html <-- /eye/video (MJPEG) + /eye/snapshot (unchanged routes)
 ```
+
+Any laptop on the same network that runs `secondcheck.py` will find the
+tracker automatically via the beacon. If broadcast is blocked on your
+network, pin it in the laptop `.env`: `EYE_TRACKER_URL=http://<pi-ip>:8130`.
 
 On the Pi (needs python3 with opencv and numpy only — all networking is
 Python stdlib, no pip packages. The repo `venv/` is macOS-only, don't use it
@@ -236,7 +245,6 @@ stream is parsed over plain HTTP):
 ```json
 {
   "eye_stream_url": "http://<esp32-ip>:81/stream",
-  "eye_server_url": "http://<laptop-ip>:3001",
   "round1_seconds": 8.0,
   "pupil_min_px": 14,
   "pupil_max_px": 80
@@ -249,7 +257,7 @@ stream is parsed over plain HTTP):
 
 Env vars with the same names uppercased (`EYE_STREAM_URL`, `PUPIL_MIN_PX`,
 ...) override the json for one-off runs. Headless — no windows, no GUI deps;
-it reconnects to both the stream and the server on its own.
+it reconnects to the ESP32 on its own, and the laptop reconnects to it.
 
 ### Run at boot (QNX)
 

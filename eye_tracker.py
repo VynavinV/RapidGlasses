@@ -1,36 +1,47 @@
-"""QNX-side eye tracking service (runs on the Raspberry Pi 5).
+"""QNX-side eye tracking server (runs on the Raspberry Pi 5).
 
-Headless: no windows, no GUI deps. Reads the ESP32-S3 IR stream, runs the
-Tracker from main.py (detection + Kalman + overlays), and pushes each
-annotated frame plus a JSON metrics header to the Flask server on the laptop:
+Zero-config apart from the ESP32 stream URL: run `python3 eye_tracker.py`
+and everything is served from this box. The laptop (eye.py in secondcheck)
+finds it automatically via the UDP beacon and pulls what it needs:
 
-    POST {eye_server_url}/eye/ingest   body = JPEG, X-Metrics = json
+    GET /eye/video      annotated MJPEG (pupil ellipse, trail, HUD panel)
+    GET /eye/snapshot   latest metrics JSON incl. round-1 verdict
+    GET /eye/summary    pupil stats + sampled frames (for the final report)
+
+Beacon: broadcasts {"name": "rapidglasses-eye", "port": 8130} on UDP 8131
+every 2s so no IPs need configuring on the laptop.
 
 Round 1 (pupil check): once a pupil is locked, diameters are collected for
-round1_seconds; the median is compared against [pupil_min_px, pupil_max_px].
-The verdict rides along in every metrics packet as `round1` — the webapp
-polls it via /eye/snapshot and decides whether to abort to the report.
+round1_seconds; the median is compared against [pupil_min_px, pupil_max_px]
+and the verdict rides in every snapshot as `round1`.
 
-Config: eye_config.json next to this file (see repo copy). Env vars with the
-same uppercase names override it, e.g. EYE_STREAM_URL, PUPIL_MIN_PX.
+Config: eye_config.json next to this file. Env vars with the same uppercase
+names override it, e.g. EYE_STREAM_URL.
 
-Dependencies: opencv (core/imgproc/imgcodecs — no GUI, no video IO backend)
-and numpy only. All networking is Python stdlib (urllib/http.client), so no
-pip packages are needed on QNX.
+Headless. Dependencies: opencv (core/imgproc/imgcodecs — no GUI, no video IO
+backend) and numpy only; all networking is Python stdlib.
 """
 import json
 import os
+import socket
+import threading
 import time
 import urllib.request
-from http.client import HTTPConnection, HTTPException
-from urllib.parse import urlparse
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
 import numpy as np
 
 from main import Tracker
 
-NetworkError = (OSError, HTTPException)   # covers URLError, timeouts, resets
+HTTP_PORT = 8130
+BEACON_PORT = 8131
+JPEG_QUALITY = 70
+STALE_AFTER = 3.0        # no ESP32 frame for this long -> connected: false
+SAMPLE_GAP = 5.0         # keep one frame every N seconds for the report
+MAX_SAMPLES = 8
+MAX_DIAMS = 4000         # ~3 min of pupil history at 20fps
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _cfg = {}
@@ -47,22 +58,25 @@ def cfg(key, default):
 
 
 STREAM_URL = cfg("eye_stream_url", "http://10.94.64.101:81/stream")
-SERVER_URL = cfg("eye_server_url", "http://localhost:3001")
-INGEST_URL = SERVER_URL + "/eye/ingest"
-
-JPEG_QUALITY = 70
 ROUND1_SECONDS = float(cfg("round1_seconds", 8.0))
 PUPIL_MIN_PX = float(cfg("pupil_min_px", 14))   # constricted below this
 PUPIL_MAX_PX = float(cfg("pupil_max_px", 80))   # blown above this
+
+# ---- shared state: written by the tracker loop, read by HTTP handlers ----
+_lock = threading.Lock()
+_jpeg = None
+_metrics = {}
+_frame_ts = 0.0
+_samples = deque(maxlen=MAX_SAMPLES)   # (ts, jpeg)
+_diams = deque(maxlen=MAX_DIAMS)
 
 
 def mjpeg_frames(url):
     """Yield BGR frames from an MJPEG-over-HTTP stream.
 
     urllib + cv2.imdecode: works on QNX opencv builds that have no video IO
-    backend (ffmpeg/gstreamer) and no GUI. JPEGs are cut out of the byte
-    stream at their SOI/EOI markers (ffd8/ffd9), which is all the ESP32
-    MJPEG framing needs. Raises OSError/URLError when the stream drops.
+    backend and no GUI. JPEGs are cut at their SOI/EOI markers (ffd8/ffd9).
+    Raises OSError when the stream drops.
     """
     resp = urllib.request.urlopen(url, timeout=10)
     buf = b""
@@ -85,40 +99,16 @@ def mjpeg_frames(url):
             buf = b""
 
 
-class IngestSender:
-    """POSTs frames over one persistent http.client connection, reconnecting
-    on failure. stdlib replacement for a requests.Session."""
-
-    def __init__(self, url):
-        u = urlparse(url)
-        self.host = u.hostname
-        self.port = u.port or 80
-        self.path = u.path
-        self.conn = None
-
-    def send(self, jpg_bytes, metrics):
-        if self.conn is None:
-            self.conn = HTTPConnection(self.host, self.port, timeout=1.0)
-        try:
-            self.conn.request("POST", self.path, body=jpg_bytes,
-                              headers={"Content-Type": "image/jpeg",
-                                       "X-Metrics": json.dumps(metrics)})
-            self.conn.getresponse().read()
-        except NetworkError:
-            self.conn.close()
-            self.conn = None
-            raise
-
-
-def run_session(frames, sender):
-    """One connected stream session. Returns/raises when the stream drops."""
+def run_session():
+    """One ESP32 connection: track, annotate, publish to shared state.
+    Returns/raises when the stream drops; round 1 restarts with the stream."""
+    global _jpeg, _metrics, _frame_ts
     tracker = Tracker()
     r1_start = None
     r1_diams = []
     round1 = {"done": False}
-    send_fail_logged = False
 
-    for frame in frames:
+    for frame in mjpeg_frames(STREAM_URL):
         display, m = tracker.process(frame)
         now = time.time()
 
@@ -145,25 +135,116 @@ def run_session(frames, sender):
                                [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         if not ok:
             continue
+        with _lock:
+            _jpeg = jpg.tobytes()
+            _metrics = m
+            _frame_ts = now
+            if m["active"] and m["diam"]:
+                _diams.append(m["diam"])
+            if not _samples or now - _samples[-1][0] >= SAMPLE_GAP:
+                _samples.append((now, _jpeg))
+
+
+def tracker_loop():
+    while True:
         try:
-            sender.send(jpg.tobytes(), m)
-            send_fail_logged = False
-        except NetworkError:
-            if not send_fail_logged:
-                print(f"cannot reach server at {INGEST_URL} (retrying quietly)")
-                send_fail_logged = True
+            print(f"connecting to {STREAM_URL}")
+            run_session()
+            print("stream ended")
+        except OSError as exc:
+            print(f"stream error: {exc}")
+        time.sleep(2)
+
+
+def beacon_loop():
+    """Announce this tracker on the LAN so the laptop needs no config.
+    Also sent to localhost so same-machine testing works."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    msg = json.dumps({"name": "rapidglasses-eye", "port": HTTP_PORT}).encode()
+    while True:
+        for dest in ("255.255.255.255", "127.0.0.1"):
+            try:
+                s.sendto(msg, (dest, BEACON_PORT))
+            except OSError:
+                pass
+        time.sleep(2)
+
+
+def _snapshot():
+    with _lock:
+        m = dict(_metrics)
+        age = time.time() - _frame_ts if _frame_ts else None
+    m["connected"] = age is not None and age < STALE_AFTER
+    m["age"] = round(age, 2) if age is not None else None
+    return m
+
+
+def _summary():
+    """Pupil stats + up to 4 base64 sample frames for the report builder."""
+    import base64
+    with _lock:
+        diams = list(_diams)
+        samples = list(_samples)
+        m = dict(_metrics)
+    out = {"round1": m.get("round1"), "last_metrics": m}
+    if diams:
+        s = sorted(diams)
+        out["pupil_px"] = {
+            "mean": round(sum(diams) / len(diams), 1),
+            "median": round(s[len(s) // 2], 1),
+            "min": round(s[0], 1),
+            "max": round(s[-1], 1),
+            "samples": len(diams),
+        }
+    out["images_b64"] = [base64.b64encode(j).decode()
+                         for _, j in samples[-4:]]
+    return out
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _json(self, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path.startswith("/eye/snapshot"):
+            self._json(_snapshot())
+        elif self.path.startswith("/eye/summary"):
+            self._json(_summary())
+        elif self.path.startswith("/eye/video"):
+            self.send_response(200)
+            self.send_header("Content-Type",
+                             "multipart/x-mixed-replace; boundary=frame")
+            self.end_headers()
+            try:
+                while True:
+                    with _lock:
+                        jpg = _jpeg
+                    if jpg is not None:
+                        self.wfile.write(
+                            b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                            + jpg + b"\r\n")
+                    time.sleep(0.05)
+            except OSError:
+                pass               # viewer disconnected
+        else:
+            self.send_error(404)
+
+    def log_message(self, *args):
+        pass                       # keep the log to tracker events only
 
 
 def main():
-    sender = IngestSender(INGEST_URL)
-    while True:
-        try:
-            print(f"connecting to {STREAM_URL} -> {INGEST_URL}")
-            run_session(mjpeg_frames(STREAM_URL), sender)
-            print("stream ended")
-        except NetworkError as exc:
-            print(f"stream error: {exc}")
-        time.sleep(2)
+    threading.Thread(target=tracker_loop, daemon=True).start()
+    threading.Thread(target=beacon_loop, daemon=True).start()
+    print(f"serving on 0.0.0.0:{HTTP_PORT} "
+          f"(beacon on udp {BEACON_PORT})")
+    ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler).serve_forever()
 
 
 if __name__ == "__main__":

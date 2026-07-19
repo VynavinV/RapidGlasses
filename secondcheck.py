@@ -7,11 +7,11 @@ from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 
+load_dotenv()   # before local imports — eye/gemini_report read env at import
+
 import eye
 from gemini_report import write_abnormal, write_full
 from tracking import tracking_bp
-
-load_dotenv()
 
 VOICE_ID = "21m00Tcm4TlvDq8ikWAM"  # Rachel — swap as needed
 MODEL_ID = "eleven_turbo_v2_5"
