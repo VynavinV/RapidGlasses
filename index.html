@@ -179,10 +179,25 @@
     color: var(--gray);
     z-index: 50;
   }
+
+  /* Stage indicator (top left) so the audience always knows where we are */
+  #stage-badge {
+    position: fixed;
+    left: 1.2rem; top: 1.2rem;
+    padding: 0.55rem 1.1rem;
+    border-radius: 2rem;
+    background: var(--blue-soft);
+    color: var(--blue);
+    font-size: 0.95rem;
+    font-weight: 600;
+    z-index: 50;
+  }
+  #stage-badge:empty { display: none; }
 </style>
 </head>
 <body>
 
+<div id="stage-badge"></div>
 <div id="hr-badge"><span class="heart">&#10084;</span><span class="bpm" id="hr-value">--</span><span>bpm</span></div>
 <div id="hr-status"></div>
 <div id="pip-stack">
@@ -191,15 +206,15 @@
 </div>
 
 <div class="screen active" id="waiting">
-  <h1>Round 1 — Pupil check</h1>
+  <h1>Stage 1 — Eyes</h1>
   <img id="eye-big" alt="eye tracker stream">
-  <p class="instruction" id="waiting-status">Waiting for the eye tracker...</p>
+  <p class="instruction" id="waiting-status">Checking pupil size and eye movement...</p>
   <button class="secondary" onclick="show('intro')">Skip (no tracker)</button>
 </div>
 
 <div class="screen" id="intro">
-  <h1>Quick check-in</h1>
-  <p class="instruction">We'll do a few short exercises together. Just follow the instructions on screen.</p>
+  <h1>Stage 2 — Sway, Vitals &amp; Cognition</h1>
+  <p class="instruction">Next: balance, heart and breathing rate, and a short memory test. Just follow the instructions on screen.</p>
   <button onclick="startRecallPriming()">Begin</button>
 </div>
 
@@ -216,6 +231,7 @@
 </div>
 
 <div class="screen" id="balance">
+  <h1>Balance</h1>
   <p class="instruction">Look at the dot. Try to stay still.</p>
   <div class="stage">
     <svg class="ring" id="balance-ring" width="120" height="120">
@@ -228,12 +244,14 @@
 </div>
 
 <div class="screen" id="pursuit">
+  <h1>Smooth Pursuit</h1>
   <p class="instruction">Follow the dot with your eyes. Keep your head still.</p>
   <div class="stage"><div class="dot" id="pursuit-dot"></div></div>
   <div class="footer"><button id="pursuit-next" disabled onclick="startVor()">Next</button></div>
 </div>
 
 <div class="screen" id="vor">
+  <h1>Head Turns (VOR)</h1>
   <p class="instruction">Keep your eyes on the dot. Gently turn your head side to side.</p>
   <div class="stage"><div class="dot pacing"></div></div>
   <div class="footer"><button id="vor-next" disabled onclick="startRecallMarking()">Next</button></div>
@@ -252,14 +270,15 @@
 </div>
 
 <script>
-// ---- Durations (ms) — tune here ----
+// ---- Durations (ms) — tuned for a ~3 min pitch demo ----
 const RECALL_FALLBACK_MS = 8000; // enable Next even if audio 'ended' never fires
 const CALIB_POLL_MS    = 300;
-const CALIB_TIMEOUT_MS = 25000; // give up waiting for a face, run the tests anyway
-const CALIB_SETTLE_MS  = 1200;  // let a few stable frames land before Balance
-const BALANCE_MS      = 20000;
-const PURSUIT_MS      = 15000;
-const VOR_MS          = 20000;
+const CALIB_TIMEOUT_MS = 10000; // give up waiting for a face, run the tests anyway
+const CALIB_SETTLE_MS  = 800;   // let a few stable frames land before Balance
+const BALANCE_MS      = 8000;
+const PURSUIT_MS      = 8000;
+const VOR_MS          = 8000;
+const AUTO_ADVANCE_MS = 1500;   // tests roll into each other for the demo
 
 // ---- Head tracking (local Flask blueprint) ----
 const TRACKING_BASE = 'http://localhost:3001/tracking';
@@ -341,9 +360,22 @@ setInterval(() => {
     });
 }, 1000);
 
+const STAGE_LABELS = {
+  'waiting': 'Stage 1 of 2 · Eyes — pupil & movement',
+  'intro': 'Stage 2 of 2 · Sway, vitals & cognition',
+  'recall-priming': 'Stage 2 of 2 · Cognition — word recall',
+  'calibration': 'Stage 2 of 2 · Sway — calibrating',
+  'balance': 'Stage 2 of 2 · Sway — balance',
+  'pursuit': 'Stage 2 of 2 · Sway — smooth pursuit',
+  'vor': 'Stage 2 of 2 · Sway — VOR',
+  'recall-marking': 'Stage 2 of 2 · Cognition — recall check',
+  'complete': 'Generating report',
+};
+
 function show(id) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.getElementById(id).classList.add('active');
+  document.getElementById('stage-badge').textContent = STAGE_LABELS[id] || '';
   // Eye stream: big on the round-1 waiting screen, small pip everywhere else
   // (bottom right, above the webcam feed). Two <img>s, one MJPEG src each.
   const big = document.getElementById('eye-big');
@@ -361,9 +393,10 @@ function show(id) {
 }
 
 // ---- Round 1: pupil check on the QNX eye tracker ----
-// The Pi computes the verdict (median pupil px over ~8s vs normal range) and
-// ships it in every metrics packet; we just poll /eye/snapshot and branch:
-// abnormal -> finalize an N/A report and jump straight to it; normal -> intro.
+// The Pi computes the verdict (median pupil px over 5s vs normal range) and
+// ships it in every metrics packet; we just poll /eye/snapshot. Demo mode:
+// an abnormal verdict is flagged for the report but NEVER stops the run —
+// both stages always execute so the full flow can be presented.
 let round1Result = null;
 let round1Timer = null;
 
@@ -382,13 +415,10 @@ function pollRound1() {
           : 'Finding pupil...';
       } else {
         round1Result = s.round1;
-        if (s.round1.abnormal) {
-          status.textContent =
-            `Abnormal pupil size (${s.round1.median_px} px) — preparing report...`;
-          return abnormalExit(s.round1);
-        }
-        status.textContent = 'Pupils normal — starting assessment';
-        setTimeout(() => show('intro'), 1200);
+        status.textContent = s.round1.abnormal
+          ? `Abnormal pupil size (${s.round1.median_px} px) — flagged for the report. Continuing to Stage 2.`
+          : 'Pupils normal — continuing to Stage 2';
+        setTimeout(() => show('intro'), 1500);
         return;
       }
       round1Timer = setTimeout(pollRound1, EYE_POLL_MS);
@@ -399,18 +429,12 @@ function pollRound1() {
     });
 }
 
-function abnormalExit(r1) {
-  fetch(FINALIZE_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      abnormal: true,
-      reason: `median pupil ${r1.median_px}px outside ${r1.min_px}-${r1.max_px}px`,
-      round1: r1
-    })
-  })
-    .catch(() => {})
-    .finally(() => { location.href = REPORT_URL; });
+// Auto-advance helper: move on after a beat, unless the presenter already
+// clicked Next (the source screen is no longer active).
+function autoAdvance(fromId, nextFn) {
+  setTimeout(() => {
+    if (document.getElementById(fromId).classList.contains('active')) nextFn();
+  }, AUTO_ADVANCE_MS);
 }
 
 // ---- Sway capture: read the tracking stats at the end of each test ----
@@ -435,6 +459,7 @@ function startRecallPriming() {
   playRecallWords().then(() => {
     document.getElementById('wave').classList.add('idle');
     document.getElementById('recall-next').disabled = false;
+    autoAdvance('recall-priming', startCalibration);
   });
 }
 
@@ -525,6 +550,7 @@ function startBalance() {
     else {
       captureSway('balance');
       document.getElementById('balance-next').disabled = false;
+      autoAdvance('balance', startPursuit);
     }
   })(start);
 }
@@ -552,6 +578,7 @@ function startPursuit() {
     else {
       captureSway('pursuit');
       document.getElementById('pursuit-next').disabled = false;
+      autoAdvance('pursuit', startVor);
     }
   })(start);
 }
@@ -565,6 +592,7 @@ function startVor() {
   setTimeout(() => {
     captureSway('vor');
     document.getElementById('vor-next').disabled = false;
+    autoAdvance('vor', startRecallMarking);
   }, VOR_MS);
 }
 

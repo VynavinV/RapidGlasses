@@ -1,6 +1,6 @@
 {
   "eye_stream_url": "http://10.94.64.101:81/stream",
-  "round1_seconds": 8.0,
+  "round1_seconds": 5.0,
   "pupil_min_px": 14,
   "pupil_max_px": 80
 }

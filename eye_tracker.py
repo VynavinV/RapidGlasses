@@ -6,7 +6,9 @@ finds it automatically via the UDP beacon and pulls what it needs:
 
     GET /eye/video      annotated MJPEG (pupil ellipse, trail, HUD panel)
     GET /eye/snapshot   latest metrics JSON incl. round-1 verdict
-    GET /eye/summary    pupil stats + sampled frames (for the final report)
+
+Nothing is stored on this box: frames and metrics are relayed and the
+laptop (eye.py) accumulates the pupil history and report samples locally.
 
 Beacon: broadcasts {"name": "rapidglasses-eye", "port": 8130} on UDP 8131
 every 2s so no IPs need configuring on the laptop.
@@ -27,7 +29,6 @@ import socket
 import threading
 import time
 import urllib.request
-from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
@@ -39,9 +40,6 @@ HTTP_PORT = 8130
 BEACON_PORT = 8131
 JPEG_QUALITY = 70
 STALE_AFTER = 3.0        # no ESP32 frame for this long -> connected: false
-SAMPLE_GAP = 5.0         # keep one frame every N seconds for the report
-MAX_SAMPLES = 8
-MAX_DIAMS = 4000         # ~3 min of pupil history at 20fps
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _cfg = {}
@@ -58,7 +56,7 @@ def cfg(key, default):
 
 
 STREAM_URL = cfg("eye_stream_url", "http://10.94.64.101:81/stream")
-ROUND1_SECONDS = float(cfg("round1_seconds", 8.0))
+ROUND1_SECONDS = float(cfg("round1_seconds", 5.0))
 PUPIL_MIN_PX = float(cfg("pupil_min_px", 14))   # constricted below this
 PUPIL_MAX_PX = float(cfg("pupil_max_px", 80))   # blown above this
 
@@ -67,8 +65,6 @@ _lock = threading.Lock()
 _jpeg = None
 _metrics = {}
 _frame_ts = 0.0
-_samples = deque(maxlen=MAX_SAMPLES)   # (ts, jpeg)
-_diams = deque(maxlen=MAX_DIAMS)
 
 
 def mjpeg_frames(url):
@@ -139,10 +135,6 @@ def run_session():
             _jpeg = jpg.tobytes()
             _metrics = m
             _frame_ts = now
-            if m["active"] and m["diam"]:
-                _diams.append(m["diam"])
-            if not _samples or now - _samples[-1][0] >= SAMPLE_GAP:
-                _samples.append((now, _jpeg))
 
 
 def tracker_loop():
@@ -180,28 +172,6 @@ def _snapshot():
     return m
 
 
-def _summary():
-    """Pupil stats + up to 4 base64 sample frames for the report builder."""
-    import base64
-    with _lock:
-        diams = list(_diams)
-        samples = list(_samples)
-        m = dict(_metrics)
-    out = {"round1": m.get("round1"), "last_metrics": m}
-    if diams:
-        s = sorted(diams)
-        out["pupil_px"] = {
-            "mean": round(sum(diams) / len(diams), 1),
-            "median": round(s[len(s) // 2], 1),
-            "min": round(s[0], 1),
-            "max": round(s[-1], 1),
-            "samples": len(diams),
-        }
-    out["images_b64"] = [base64.b64encode(j).decode()
-                         for _, j in samples[-4:]]
-    return out
-
-
 class Handler(BaseHTTPRequestHandler):
     def _json(self, obj):
         body = json.dumps(obj).encode()
@@ -214,8 +184,6 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/eye/snapshot"):
             self._json(_snapshot())
-        elif self.path.startswith("/eye/summary"):
-            self._json(_summary())
         elif self.path.startswith("/eye/video"):
             self.send_response(200)
             self.send_header("Content-Type",

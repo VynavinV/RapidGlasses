@@ -122,7 +122,11 @@ def _finalize(stages):
     """All required stages present: resolve the flag rule-based, then let
     Gemini rewrite the narration (fallback text survives any failure)."""
     report = _build_report(stages)
-    narration = gemini_report.generate_narration(report)
+    # Gemini gets the report minus the base64 frames — images are token-heavy
+    # and the narration prompt is text-only.
+    slim = dict(report, stage1={k: v for k, v in report["stage1"].items()
+                                if k != "eye_path_images"})
+    narration = gemini_report.generate_narration(slim)
     if narration:
         report["narration"] = narration
     with _lock:
@@ -202,12 +206,14 @@ def _build_report(stages):
             "plr": {"stimulus_used": False, "amplitude_percent": NA,
                     "reference_min_percent": NA, "status": NA},
             "hrv": {"heart_rate_bpm": vitals.get("bpm", NA),
+                    "breathing_rate_min": vitals.get("breathing", NA),
                     "hrv_rmssd_ms": NA, "source": "Presage (laptop)",
                     "status": NA},
+            "eye_path_images": stage1.get("images_b64") or [],
         },
         "stage3": {
             "balance": {"sway_magnitude_px": balance.get("mean_deviation", NA),
-                        "sway_frequency_hz": NA, "duration_seconds": 20,
+                        "sway_frequency_hz": NA, "duration_seconds": 10,
                         "threshold_magnitude_px": BALANCE_SWAY_THRESHOLD,
                         "status": ("deviation" if any(
                             "sway" in d for d in deviations) else "normal")},
@@ -247,10 +253,12 @@ def _fallback_narration(flag, deviations):
     }
 
 
-def write_abnormal(reason, eye):
+def write_abnormal(reason, eye, vitals=None):
     """Round-1 pupil failure: immediate refer report, no Gemini, remaining
     tests never run."""
-    round1 = (eye or {}).get("round1") or {}
+    eye = eye or {}
+    vitals = vitals or {}
+    round1 = eye.get("round1") or {}
     med = round1.get("median_px", NA)
     report = {
         "session_id": "RG-" + time.strftime("%Y%m%d-%H%M%S"),
@@ -278,8 +286,11 @@ def write_abnormal(reason, eye):
                       "status": NA},
             "plr": {"stimulus_used": False, "amplitude_percent": NA,
                     "reference_min_percent": NA, "status": NA},
-            "hrv": {"heart_rate_bpm": NA, "hrv_rmssd_ms": NA,
+            "hrv": {"heart_rate_bpm": vitals.get("bpm", NA),
+                    "breathing_rate_min": vitals.get("breathing", NA),
+                    "hrv_rmssd_ms": NA,
                     "source": "Presage (laptop)", "status": NA},
+            "eye_path_images": eye.get("images_b64") or [],
         },
         "stage3": {},
         "fusion": {"decision_basis": f"Hard stop at round 1: {reason}. "

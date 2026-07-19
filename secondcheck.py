@@ -35,23 +35,36 @@ def finalize():
     if payload.get("round1"):      # browser-confirmed verdict wins over stale
         eye_summary["round1"] = payload["round1"]
 
+    try:
+        vitals = requests.get("http://localhost:3002/vitals", timeout=1).json()
+    except Exception as exc:       # vitals stage is optional
+        print(f"vitals unavailable: {exc}")
+        vitals = None
+
     if payload.get("abnormal"):
         report_store.write_abnormal(
-            payload.get("reason", "pupil size out of range"), eye_summary)
+            payload.get("reason", "pupil size out of range"), eye_summary,
+            vitals)
         return jsonify(ok=True)
 
+    # vitals before stage1: stage1 completes the required set and triggers
+    # finalize, so vitals must already be in the store to reach the report
+    if vitals:
+        try:
+            report_store.merge_stage("vitals", vitals)
+        except ValueError as exc:
+            print(f"vitals not merged: {exc}")
     try:
         report_store.merge_stage("stage1", {
-            "round1": eye_summary.get("round1"),
+            # placeholder round1 when no tracker was present: the report must
+            # still finalize (demo runs the full flow no matter what)
+            "round1": eye_summary.get("round1")
+                      or {"done": False, "abnormal": False},
             "pupil_px": eye_summary.get("pupil_px"),
+            "images_b64": eye_summary.get("images_b64", []),
         })
     except ValueError as exc:
         print(f"stage1 not merged: {exc}")
-    try:
-        vitals = requests.get("http://localhost:3002/vitals", timeout=1).json()
-        report_store.merge_stage("vitals", vitals)
-    except Exception as exc:       # vitals stage is optional
-        print(f"vitals not merged: {exc}")
     return jsonify(ok=True)
 
 

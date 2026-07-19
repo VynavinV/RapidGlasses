@@ -59,7 +59,7 @@ def generate_narration(report):
     }
     try:
         resp = requests.post(GEMINI_URL.format(model=GEMINI_MODEL, key=key),
-                             json=body, timeout=60)
+                             json=body, timeout=20)
         resp.raise_for_status()
         text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
         data = json.loads(text)
