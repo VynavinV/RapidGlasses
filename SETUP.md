@@ -225,8 +225,10 @@ ESP32 IR cam --> eye_tracker.py (Pi/QNX) --POST /eye/ingest--> secondcheck.py :3
                               index.html <-- /eye/video (MJPEG) + /eye/snapshot
 ```
 
-On the Pi (needs python3 with opencv, numpy, requests — the repo `venv/` is
-macOS-only, don't use it there):
+On the Pi (needs python3 with opencv and numpy only — all networking is
+Python stdlib, no pip packages. The repo `venv/` is macOS-only, don't use it
+there. The opencv build needs no GUI and no video IO backend: the MJPEG
+stream is parsed over plain HTTP):
 
 1. `git clone` the repo (already done if you're reading this on the Pi).
 2. Edit **`eye_config.json`** — this is the only file you should need to touch:
